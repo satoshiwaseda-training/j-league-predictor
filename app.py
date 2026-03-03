@@ -40,15 +40,18 @@ from prediction_store import (
 
 load_dotenv()
 
-# Streamlit Cloud 対応: st.secrets → os.environ に橋渡し（ローカル .env と共存）
-_SECRET_KEYS = ["GEMINI_API_KEY"]
-for _sk in _SECRET_KEYS:
-    try:
-        _sv = st.secrets.get(_sk)
-        if _sv and _sk not in os.environ:
-            os.environ[_sk] = str(_sv)
-    except Exception:
-        pass
+# Streamlit Cloud secrets ブリッジ（main()内で呼び出す）
+def _apply_secrets():
+    """st.secrets の内容を os.environ に転写する（Streamlit Cloud 対応）"""
+    for _k in ("GEMINI_API_KEY",):
+        if os.environ.get(_k):
+            continue
+        try:
+            _v = st.secrets[_k]
+            if _v:
+                os.environ[_k] = str(_v)
+        except Exception:
+            pass
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -507,13 +510,6 @@ def sidebar() -> tuple[str, dict | None]:
 
         st.markdown("---")
         ak = os.getenv("GEMINI_API_KEY", "")
-        if not ak:
-            try:
-                ak = st.secrets.get("GEMINI_API_KEY", "")
-                if ak:
-                    os.environ["GEMINI_API_KEY"] = str(ak)
-            except Exception:
-                pass
         if ak and ak != "your_gemini_api_key_here":
             st.success("Gemini 2.0 Flash 接続済み ✓")
         else:
@@ -1602,6 +1598,9 @@ def render_about():
 # ─── メイン ───────────────────────────────────────────────
 
 def main():
+    # Streamlit Cloud secrets → os.environ（毎回チェック、未設定時のみ転写）
+    _apply_secrets()
+
     # PWA マニフェスト・モバイルメタタグを注入（初回のみ）
     if "pwa_injected" not in st.session_state:
         _inject_pwa_meta()

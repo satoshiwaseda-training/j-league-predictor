@@ -25,9 +25,9 @@ def _get_gemini_client():
     if not api_key:
         try:
             import streamlit as _st
-            api_key = _st.secrets.get("GEMINI_API_KEY", "")
+            api_key = str(_st.secrets["GEMINI_API_KEY"])
             if api_key:
-                os.environ["GEMINI_API_KEY"] = str(api_key)
+                os.environ["GEMINI_API_KEY"] = api_key
         except Exception:
             pass
     if not api_key or api_key == "your_gemini_api_key_here":
