@@ -1,0 +1,66 @@
+# ======================================================
+# .gitignore — サトシのJリーグ予測システム
+# ======================================================
+
+# ─── APIキー・シークレット（絶対コミット禁止！）────────
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ─── Python キャッシュ ──────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyo
+
+# ─── 仮想環境 ─────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ─── データファイル（ローカルのみ）─────────────────
+data/predictions.json
+
+# ─── デバッグ用一時 .txt ────────────────────────────
+/j1_result.txt
+/j2_2026_data.txt
+/j2_2026_hunt.txt
+/j2_check.txt
+/j2_latest.txt
+/j2_result.txt
+/j2_sec1.txt
+/j2_sections.txt
+/j2_standings.txt
+/j2_url_hunt.txt
+/j2_year_test.txt
+/j2j3_full.txt
+/j2j3_latest.txt
+/j2j3_sections.txt
+/final_check.txt
+/standings_check.txt
+
+# ─── Claude Code 作業ファイル ──────────────────────
+.claude/
+
+# ─── OS 固有 ────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.lnk
+
+# ─── IDE ─────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-*
+
+# ─── ビルド成果物 ──────────────────────────────────
+dist/
+build/
+*.egg-info/
+.eggs/
+*.egg

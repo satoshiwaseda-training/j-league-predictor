@@ -1,0 +1,755 @@
+"""
+scripts/predict_logic.py - Jリーグ予測コアロジック v3
+Gemini 2.0 Flash 設計会議 (2026-03) + 論文ベース最適化
+
+v3 追加パラメータ (Gemini設計):
+  capital_power:   0.12  親会社収益・年俸総額スカッド質 (Peeters 2018: R²≈0.65-0.72)
+  discipline_risk: 0.04  イエロー累積 → 守備断絶リスク
+  attrition_rate:  0.04  損耗率 (怪我人比率) → 戦力維持能力
+  match_interval:  0.04  試合間隔疲労 U字型 (Drust 2012, Pope 2015)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import sys
+from typing import Any
+
+from dotenv import load_dotenv
+
+# スクリプトから親ディレクトリをインポートできるようにする
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+# ─── Gemini v3 設計重み (2026-03-01 第2回設計会議) ─────
+# 重み合計 = 1.00 (Gemini推奨値 + 端数調整)
+MODEL_WEIGHTS: dict[str, float] = {
+    "team_strength":    0.15,  # 勝点・順位差
+    "attack_rate":      0.10,  # 得点率/試合 (Dixon-Coles λ)
+    "defense_rate":     0.08,  # 失点率/試合 (Dixon-Coles μ)
+    "recent_form":      0.18,  # 直近フォームPPG (最信頼性)
+    "xg_differential":  0.08,  # xG差 (FBref J1)
+    "home_advantage":   0.10,  # ホームADV
+    "capital_power":    0.12,  # 新: 資本力 (R²≈0.65-0.72 vs 勝点)
+    "head_to_head":     0.04,  # H2H (Cohen's d小)
+    "discipline_risk":  0.04,  # 新: 規律・カード累積リスク
+    "attrition_rate":   0.04,  # 新: 損耗率 (スカッド比率)
+    "match_interval":   0.04,  # 新: 試合間隔疲労 U字型
+    "injury_impact":    0.02,  # 個別怪我絶対数
+    "weather_fatigue":  0.01,  # 天気疲労 (効果小)
+    "travel_distance":  0.00,  # 移動距離 (J地理圧縮 → 実質0)
+}
+
+# ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
+# 根拠: Jリーグ開示営業費用・Transfermarkt推定スカッド価値・各社IR資料
+# Peeters(2018): log(squad_value)がシーズン勝点分散の65-72%を説明
+_TEAM_CAPITAL_SCORES: dict[str, float] = {
+    # J1 最上位 (大企業・楽天・日産バック / 推定年俸総額 >15億円)
+    "ヴィッセル神戸":           0.95,  # 楽天グループ (三木谷オーナー)
+    "浦和レッズ":               0.92,  # 三菱グループ / DAZN
+    "横浜F・マリノス":          0.88,  # 日産・シティグループ
+    "川崎フロンターレ":         0.82,  # 富士通・UIターン効果
+    "ガンバ大阪":               0.80,  # パナソニック系
+    "鹿島アントラーズ":         0.78,  # メルカリ (上場IT企業)
+    # J1 上位 (中堅企業バック / 10-15億円)
+    "名古屋グランパス":         0.73,  # トヨタ自動車
+    "FC東京":                   0.70,  # 東京ガス / MIXI
+    "セレッソ大阪":             0.68,  # ヤンマー
+    "サンフレッチェ広島":       0.65,
+    "FC町田ゼルビア":           0.68,  # サイバーエージェント (上場IT)
+    "北海道コンサドーレ札幌":   0.60,
+    "柏レイソル":               0.60,  # 日立製作所
+    # J1 中位 (7-10億円)
+    "アビスパ福岡":             0.55,
+    "京都サンガF.C.":           0.52,
+    "東京ヴェルディ":           0.50,
+    "アルビレックス新潟":       0.48,
+    "湘南ベルマーレ":           0.45,
+    # J2 上位 (5-8億円)
+    "ジェフユナイテッド千葉":   0.54,
+    "ベガルタ仙台":             0.50,
+    "ジュビロ磐田":             0.55,  # ヤマハ
+    "サガン鳥栖":               0.52,  # 林田グループ
+    "V・ファーレン長崎":        0.47,  # ジャパネットたかた
+    "ファジアーノ岡山":         0.44,
+    "モンテディオ山形":         0.42,
+    "ヴァンフォーレ甲府":       0.40,
+    "大分トリニータ":           0.40,
+    "ロアッソ熊本":             0.36,
+    # J3 (3-5億円)
+    "ギラヴァンツ北九州":       0.32,
+    "レノファ山口FC":           0.32,
+    "鹿児島ユナイテッドFC":     0.30,
+    "FC琉球":                   0.30,
+    "愛媛FC":                   0.32,
+}
+_DEFAULT_CAPITAL_SCORE = 0.45  # データなしチームのデフォルト値
+
+# ─── 移動距離・疲労 ────────────────────────────────────────
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Haversine公式で2点間の距離(km)を計算
+    サッカー科学: 600km以上の移動は翌日以降の試合でも累積疲労に影響
+    (Drust et al., 2012; Reilly et al., 1997)
+    """
+    R = 6371.0
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    Δφ = math.radians(lat2 - lat1)
+    Δλ = math.radians(lon2 - lon1)
+    a = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
+    return round(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
+
+
+def travel_fatigue_score(distance_km: float) -> float:
+    """
+    移動距離 → 疲労スコア (0.0〜1.0 高いほど疲労)
+    Gemini設計式: travel_index = distance / 1000
+    科学的根拠: 時差・気圧変化・体内時計乱れ複合効果
+    """
+    idx = distance_km / 1000.0
+    if idx < 0.3:    return 0.00   # 300km未満: 影響なし
+    elif idx < 0.6:  return 0.10   # 300-600km: 軽微
+    elif idx < 1.0:  return 0.25   # 600-1000km: 中程度
+    elif idx < 1.5:  return 0.50   # 1000-1500km: 大 (本州-北海道等)
+    else:            return 0.75   # 1500km超: 極大 (沖縄等)
+
+
+# ─── 各パラメータのスコア化 ──────────────────────────────
+
+def score_capital_power(home_team: str, away_team: str) -> tuple[float, float]:
+    """
+    資本力スコア: 親会社収益・年俸総額に基づくスカッドの質 (0.0〜1.0)
+    根拠: Peeters(2018) Journal of Sports Economics - log(squad_value) explains
+          65-72% of variance in final season points across 5 European leagues.
+    J-League: Transfermarkt推定値・各社IR資料・公開報道をもとに作成。
+    """
+    h = _TEAM_CAPITAL_SCORES.get(home_team, _DEFAULT_CAPITAL_SCORE)
+    a = _TEAM_CAPITAL_SCORES.get(away_team, _DEFAULT_CAPITAL_SCORE)
+    return h, a
+
+
+def score_discipline_risk(home_cards: dict, away_cards: dict) -> tuple[float, float]:
+    """
+    規律リスクスコア: イエローカード累積による守備安定性 (0.0〜1.0, 高いほど安定)
+    カードが多いほど: 累積停止リスク・守備陣形の崩壊・心理的プレッシャー
+
+    Parameters
+    ----------
+    home_cards/away_cards: {yellow_per_game: float, red_per_game: float}
+    データなし: 中立値 (0.60) を返す
+
+    根拠: 1試合あたりのカード数と守備失点には正の相関 (Lago-Peñas 2016)
+    """
+    def _score(cards: dict) -> float:
+        if not cards:
+            return 0.60
+        yell_pg = float(cards.get("yellow_per_game", 1.8))
+        red_pg  = float(cards.get("red_per_game",   0.05))
+        # J1平均 ~1.8枚/試合。超過分がリスク
+        penalty = 0.0
+        if yell_pg > 2.5:   penalty += 0.25
+        elif yell_pg > 2.0: penalty += 0.15
+        elif yell_pg > 1.5: penalty += 0.06
+        penalty += red_pg * 3.0   # 退場は守備上の重大リスク
+        return round(max(0.10, 0.78 - penalty), 3)
+
+    return _score(home_cards), _score(away_cards)
+
+
+def score_attrition_rate(
+    home_injuries: list[dict],
+    away_injuries: list[dict],
+    squad_size: int = 25,
+) -> tuple[float, float]:
+    """
+    損耗率スコア: 怪我人のスカッド比率による戦力維持能力 (0.0〜1.0)
+    score_injury() が「1人あたりの絶対ペナルティ」を計算するのに対し、
+    こちらは「スカッド全体の何%が失われているか」という深度指標。
+
+    根拠: チームデプスは交代オプションと戦術柔軟性に直接影響
+    """
+    def _score(injuries: list[dict]) -> float:
+        if not injuries:
+            return 0.80  # 完全無傷 = 最高スコア
+        ratio = len(injuries) / squad_size  # 0〜1
+        # 長期離脱選手の重み付け
+        long_term = sum(
+            1 for inj in injuries
+            if any(kw in str(inj.get("status", "")).lower()
+                   for kw in ["長期", "数ヶ月", "全治", "手術", "週以上"])
+        )
+        base = 0.80 - ratio * 0.60      # 怪我率ペナルティ
+        base -= long_term * 0.08         # 長期離脱追加ペナルティ
+        return round(max(0.10, base), 3)
+
+    return _score(home_injuries), _score(away_injuries)
+
+
+def score_match_interval(home_days: int, away_days: int) -> tuple[float, float]:
+    """
+    試合間隔疲労スコア (U字型, 0.0〜1.0, 高いほどコンディション良好)
+    根拠:
+      - 中3日以内: パフォーマンス最大8%低下 (Drust et al. 2012, BJSM)
+      - 中6-7日: 最適コンディション (Gemini設計)
+      - 中10日超: 試合感覚低下・筋温低下 (Pope et al. 2015)
+    0 = 不明 → 中立値 (0.52)
+
+    Gemini v3推奨スコア:
+      1-2日: 0.40, 3日: 0.45, 4-5日: 0.53, 6-7日: 0.55, 8-10日: 0.48, >10: 0.47
+    """
+    def _score(days: int) -> float:
+        if days <= 0:    return 0.52   # 不明 → 中立
+        elif days <= 2:  return 0.40   # 中1-2日: 高疲労 (-8%パフォーマンス)
+        elif days == 3:  return 0.45   # 中3日: やや疲労 (ミッドウィーク後)
+        elif days <= 5:  return 0.53   # 中4-5日: 通常コンディション
+        elif days <= 7:  return 0.55   # 中6-7日: 最適 (1週間準備)
+        elif days <= 10: return 0.48   # 中8-10日: 試合感覚低下
+        else:            return 0.47   # 中10日超: 長期ブランク
+
+    return _score(home_days), _score(away_days)
+
+
+def score_team_strength(home_stats: dict, away_stats: dict) -> tuple[float, float]:
+    """
+    勝点・順位・得失点差に基づくチーム強度スコア (0.0〜1.0)
+    2026年対応: PK勝負を考慮した勝点換算を使用。
+    得失点差も補正項として加味（実力差を強調）。
+    """
+    h_pts = float(home_stats.get("勝点", 0))
+    a_pts = float(away_stats.get("勝点", 0))
+
+    # 得失点差を補正に使う (+1差 ≈ 0.5pt相当)
+    def _gd(stats: dict) -> float:
+        raw = stats.get("得失点差", "0")
+        try:
+            return float(str(raw).replace("+", ""))
+        except ValueError:
+            return 0.0
+
+    h_effective = h_pts + _gd(home_stats) * 0.5
+    a_effective = a_pts + _gd(away_stats) * 0.5
+    total = max(h_effective + a_effective, 1)
+    return round(h_effective / total, 3), round(a_effective / total, 3)
+
+
+def score_attack_rate(home_stats: dict, away_stats: dict) -> tuple[float, float]:
+    """
+    1試合あたり平均得点率 (攻撃力) をスコア化 (0.0〜1.0)
+    Dixon-Colesモデルの攻撃パラメータ λ に相当。
+    シーズン序盤（試合数 < 6）は平均値へのシュリンクを適用。
+    根拠: Goals scored rate × season points r≈0.72-0.78 (Dixon & Coles 1997)
+    """
+    LEAGUE_AVG = 1.3  # J1 平均得点/試合
+    def _rate(stats: dict) -> float:
+        games = max(float(stats.get("試合", 1)), 1)
+        gf    = float(stats.get("得点", LEAGUE_AVG))
+        rate  = gf / games
+        # シーズン序盤は平均値にシュリンク（試合数が少ないほど強く）
+        shrink = max(0.0, 1.0 - games / 10.0)
+        return rate * (1 - shrink) + LEAGUE_AVG * shrink
+
+    h_norm = min(_rate(home_stats) / (LEAGUE_AVG * 2), 1.0)
+    a_norm = min(_rate(away_stats) / (LEAGUE_AVG * 2), 1.0)
+    return round(h_norm, 3), round(a_norm, 3)
+
+
+def score_defense_rate(home_stats: dict, away_stats: dict) -> tuple[float, float]:
+    """
+    1試合あたり平均失点率 (守備力) をスコア化 (0.0〜1.0)
+    失点が少ないほど高スコア。シーズン序盤シュリンク適用。
+    根拠: Goals conceded rate × season points r≈-0.70-0.75 (Dixon & Coles 1997)
+    """
+    LEAGUE_AVG = 1.3  # J1 平均失点/試合
+    def _rate(stats: dict) -> float:
+        games = max(float(stats.get("試合", 1)), 1)
+        ga    = float(stats.get("失点", LEAGUE_AVG))
+        rate  = ga / games
+        shrink = max(0.0, 1.0 - games / 10.0)
+        return rate * (1 - shrink) + LEAGUE_AVG * shrink
+
+    h_norm = max(0.0, 1.0 - _rate(home_stats) / (LEAGUE_AVG * 2))
+    a_norm = max(0.0, 1.0 - _rate(away_stats) / (LEAGUE_AVG * 2))
+    return round(h_norm, 3), round(a_norm, 3)
+
+
+def score_xg_differential(
+    home_xg: dict,
+    away_xg: dict,
+) -> tuple[float, float]:
+    """
+    xG差分 (期待ゴール for - against) をスコア化 (0.0〜1.0)
+    根拠: xG差分はシーズン勝点と r≈0.87-0.92 の相関 (StatsBomb, Caley 2015)
+         +8〜12pp の予測精度向上が報告されている。
+    データなし (J2/J3 or FBref失敗) → 中立 (0.5, 0.5) を返す。
+    """
+    if not home_xg or not away_xg:
+        return 0.5, 0.5  # xGデータなし → 中立（貢献度=0）
+
+    h_xgf = float(home_xg.get("xg_for",     1.3))
+    h_xga = float(home_xg.get("xg_against", 1.3))
+    a_xgf = float(away_xg.get("xg_for",     1.3))
+    a_xga = float(away_xg.get("xg_against", 1.3))
+
+    h_diff = h_xgf - h_xga   # positive = 攻守ともに優位
+    a_diff = a_xgf - a_xga
+
+    # 典型値域: -1.5〜+1.5 per game → 0〜1 に正規化
+    h_norm = min(max((h_diff + 1.5) / 3.0, 0.0), 1.0)
+    a_norm = min(max((a_diff + 1.5) / 3.0, 0.0), 1.0)
+    return round(h_norm, 3), round(a_norm, 3)
+
+
+def score_recent_form(form: list[str] | str) -> float:
+    """
+    直近5試合フォーム → スコア (0.0〜1.0)
+    入力: ['W','D','L',...] または "WWDLW" のような文字列
+    W=1.0, D=0.5, L=0.0 の加重平均（直近ほど重み大）
+    PK勝(p/P)→0.7, PK負(k/K)→0.3 として処理。
+    """
+    if isinstance(form, str):
+        form = list(form.upper())
+    if not form:
+        return 0.5
+    weights = [0.35, 0.25, 0.20, 0.12, 0.08][:len(form)]
+    values = {"W": 1.0, "P": 0.7, "D": 0.5, "K": 0.3, "L": 0.0}
+    total_w = sum(weights)
+    return round(sum(values.get(r, 0.5) * w for r, w in zip(form, weights)) / total_w, 3)
+
+
+def score_home_advantage() -> float:
+    """
+    ホームアドバンテージ: 固定スコア
+    根拠: Jリーグ統計でホーム勝率≈48%、アウェー勝率≈30%
+    差異を 0.15 スコアとして換算
+    """
+    return 0.62  # ホームチームの「ホーム強度」= 62%
+
+
+def score_h2h(h2h: dict, is_home: bool) -> float:
+    """
+    H2H成績スコア (0.0〜1.0)
+    """
+    total = max(h2h.get("total", 1), 1)
+    wins  = h2h.get("home_wins" if is_home else "away_wins", 0)
+    draws = h2h.get("draws", 0)
+    return round((wins + draws * 0.5) / total, 3)
+
+
+def score_injury(injuries: list[dict]) -> float:
+    """
+    怪我・出場停止による戦力スコア (1.0=影響なし, 0.0=主力全滅)
+    選手1人あたり -0.08〜-0.15 のペナルティ
+    """
+    if not injuries:
+        return 1.0
+    penalty = min(len(injuries) * 0.10, 0.50)
+    return round(1.0 - penalty, 3)
+
+
+def score_weather(weather: dict) -> float:
+    """
+    天気コンディション → チームスコアへの影響係数
+    疲労スコアが高いほど両チーム均等に影響するため中立的
+    Returns: 平均影響係数 (0.5 = 中立)
+    """
+    fatigue = weather.get("fatigue_factor", 0.1)
+    # 悪天候はホームチームが慣れている分若干有利: 0.52〜0.55
+    return round(0.55 - fatigue * 0.10, 3)
+
+
+# ─── パラメータ貢献度計算 ───────────────────────────────
+
+def calculate_parameter_contributions(
+    home_team: str,
+    away_team: str,
+    home_stats: dict,
+    away_stats: dict,
+    home_form: list[str],
+    away_form: list[str],
+    h2h: dict,
+    weather: dict,
+    home_injuries: list[dict],
+    away_injuries: list[dict],
+    home_venue: dict,
+    away_venue: dict,
+    home_xg: dict | None = None,          # FBref xG (J1のみ)
+    away_xg: dict | None = None,
+    home_cards: dict | None = None,       # カード規律統計
+    away_cards: dict | None = None,
+    home_days: int = 0,                   # 試合間隔 (日数)
+    away_days: int = 0,
+) -> dict[str, Any]:
+    """
+    各パラメータのホーム有利度スコアと重み付き貢献度を計算。
+
+    Returns
+    -------
+    {
+      "parameters": {
+        param_name: {
+          "home_score": float,
+          "away_score": float,
+          "home_advantage": float,  # home - away
+          "weight": float,
+          "contribution": float,    # home_advantage * weight
+        }
+      },
+      "raw_home_advantage": float,  # 加重合計
+      "distance_km": float,
+    }
+    """
+    # 移動距離
+    dist_km = haversine_km(
+        away_venue["lat"], away_venue["lon"],
+        home_venue["lat"], home_venue["lon"],
+    )
+    travel_fat = travel_fatigue_score(dist_km)
+
+    # 各スコア
+    h_str, a_str        = score_team_strength(home_stats, away_stats)
+    h_atk, a_atk        = score_attack_rate(home_stats, away_stats)
+    h_def, a_def        = score_defense_rate(home_stats, away_stats)
+    h_form              = score_recent_form(home_form)
+    a_form              = score_recent_form(away_form)
+    h_xg_s, a_xg_s     = score_xg_differential(home_xg or {}, away_xg or {})
+    h_home              = score_home_advantage()
+    a_away              = 1.0 - h_home
+    h_cap, a_cap        = score_capital_power(home_team, away_team)
+    h_h2h               = score_h2h(h2h, is_home=True)
+    a_h2h               = score_h2h(h2h, is_home=False)
+    h_disc, a_disc      = score_discipline_risk(home_cards or {}, away_cards or {})
+    h_att, a_att        = score_attrition_rate(home_injuries, away_injuries)
+    h_interval, a_interval = score_match_interval(home_days, away_days)
+    h_inj               = score_injury(home_injuries)
+    a_inj               = score_injury(away_injuries)
+    h_weather           = score_weather(weather)
+    a_weather           = 1.0 - h_weather + 0.45
+    h_travel            = 1.0
+    a_travel            = 1.0 - travel_fat
+
+    params: dict[str, dict] = {}
+    raw_adv = 0.0
+
+    for name, h_score, a_score in [
+        ("team_strength",   h_str,      a_str),
+        ("attack_rate",     h_atk,      a_atk),
+        ("defense_rate",    h_def,      a_def),
+        ("recent_form",     h_form,     a_form),
+        ("xg_differential", h_xg_s,    a_xg_s),
+        ("home_advantage",  h_home,     a_away),
+        ("capital_power",   h_cap,      a_cap),
+        ("head_to_head",    h_h2h,      a_h2h),
+        ("discipline_risk", h_disc,     a_disc),
+        ("attrition_rate",  h_att,      a_att),
+        ("match_interval",  h_interval, a_interval),
+        ("injury_impact",   h_inj,      a_inj),
+        ("weather_fatigue", h_weather,  a_weather),
+        ("travel_distance", h_travel,   a_travel),
+    ]:
+        adv = round(h_score - a_score, 3)
+        w = MODEL_WEIGHTS[name]
+        contrib = round(adv * w, 4)
+        raw_adv += contrib
+        params[name] = {
+            "home_score": h_score,
+            "away_score": a_score,
+            "home_advantage": adv,
+            "weight": w,
+            "contribution": contrib,
+        }
+
+    return {
+        "parameters": params,
+        "raw_home_advantage": round(raw_adv, 4),
+        "distance_km":  dist_km,
+        "travel_fatigue": travel_fat,
+        "home_days":    home_days,
+        "away_days":    away_days,
+        "capital_home": _TEAM_CAPITAL_SCORES.get(home_team, _DEFAULT_CAPITAL_SCORE),
+        "capital_away": _TEAM_CAPITAL_SCORES.get(away_team, _DEFAULT_CAPITAL_SCORE),
+    }
+
+
+# ─── 確率変換 ────────────────────────────────────────────
+
+def advantage_to_probs(raw_advantage: float) -> tuple[int, int, int]:
+    """
+    raw_advantage (-1〜+1) → (home_win%, draw%, away_win%)
+    シグモイド変換を使用
+    raw_advantage = 0 のとき: home:40%, draw:25%, away:35% (ホームアドバンテージ込み)
+    """
+    import math
+    # ホームベース確率
+    base_home = 0.40
+    base_draw = 0.25
+    base_away = 0.35
+
+    # raw_advantage に基づいてシグモイドシフト
+    shift = math.tanh(raw_advantage * 3) * 0.30  # -0.30〜+0.30
+
+    h = max(0.05, min(0.90, base_home + shift))
+    a = max(0.05, min(0.90, base_away - shift))
+    d = max(0.05, min(0.35, 1.0 - h - a))
+    # 正規化
+    total = h + d + a
+    h_pct = round(h / total * 100)
+    a_pct = round(a / total * 100)
+    d_pct = 100 - h_pct - a_pct
+
+    return h_pct, d_pct, a_pct
+
+
+# ─── Gemini 2.0 Flash 統合予測 ──────────────────────────
+
+def predict_with_gemini(
+    home_team: str,
+    away_team: str,
+    contributions: dict[str, Any],
+    home_stats: dict,
+    away_stats: dict,
+    home_form: list[str],
+    away_form: list[str],
+    h2h: dict,
+    weather: dict,
+    home_xg: dict | None = None,
+    away_xg: dict | None = None,
+    home_days: int = 0,
+    away_days: int = 0,
+    home_cards: dict | None = None,       # 生データ: {yellow_per_game, red_per_game}
+    away_cards: dict | None = None,
+    home_injuries: list | None = None,    # 生データ: 怪我人リスト
+    away_injuries: list | None = None,
+) -> dict[str, Any]:
+    """
+    パラメータ貢献度をGemini 2.0 Flashに渡し、
+    最終的な確率と深い分析根拠を取得する。
+    """
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key or api_key == "your_gemini_api_key_here":
+        # Gemini未設定時は統計モデルのみで予測
+        h_pct, d_pct, a_pct = advantage_to_probs(contributions["raw_home_advantage"])
+        return _statistical_result(home_team, away_team, h_pct, d_pct, a_pct, contributions)
+
+    try:
+        from google import genai
+        from google.genai import types as gtypes
+
+        client = genai.Client(api_key=api_key)
+
+        params_text = "\n".join(
+            f"  - {k}: ホーム={v['home_score']:.3f} アウェー={v['away_score']:.3f} "
+            f"差={v['home_advantage']:+.3f} 重み={v['weight']} 貢献度={v['contribution']:+.4f}"
+            for k, v in contributions["parameters"].items()
+        )
+
+        # 攻撃・守備率計算
+        h_games = max(float(home_stats.get("試合", 1)), 1)
+        a_games = max(float(away_stats.get("試合", 1)), 1)
+        h_atk_r = round(float(home_stats.get("得点", 0)) / h_games, 2)
+        h_def_r = round(float(home_stats.get("失点", 0)) / h_games, 2)
+        a_atk_r = round(float(away_stats.get("得点", 0)) / a_games, 2)
+        a_def_r = round(float(away_stats.get("失点", 0)) / a_games, 2)
+
+        # xG テキスト
+        home_xg = home_xg or {}
+        away_xg = away_xg or {}
+        xg_text = ""
+        if home_xg or away_xg:
+            xg_text = (
+                f"\n## xG (期待ゴール) [FBref J1データ]\n"
+                f"{home_team}: xG={home_xg.get('xg_for','N/A')}/試合, "
+                f"xGA={home_xg.get('xg_against','N/A')}/試合, "
+                f"SoT={home_xg.get('sot_for','N/A')}/試合\n"
+                f"{away_team}: xG={away_xg.get('xg_for','N/A')}/試合, "
+                f"xGA={away_xg.get('xg_against','N/A')}/試合, "
+                f"SoT={away_xg.get('sot_for','N/A')}/試合"
+            )
+
+        # 資本力差・新指標テキスト
+        h_cap = _TEAM_CAPITAL_SCORES.get(home_team, _DEFAULT_CAPITAL_SCORE)
+        a_cap = _TEAM_CAPITAL_SCORES.get(away_team, _DEFAULT_CAPITAL_SCORE)
+        capital_diff = h_cap - a_cap
+        # ジャイアントキリング判定 (Gemini設計: capital_diff > 0.3 = 資本格差あり)
+        gk_label = ""
+        if abs(capital_diff) >= 0.30:
+            richer = home_team if capital_diff > 0 else away_team
+            poorer = away_team if capital_diff > 0 else home_team
+            gk_label = f"⚠️ 資本格差試合: {richer}(資本力{max(h_cap,a_cap):.2f}) vs {poorer}(資本力{min(h_cap,a_cap):.2f}) → ジャイアントキリング要注意"
+
+        # 試合間隔テキスト
+        interval_text = (
+            f"{home_team}: 前試合から{home_days}日 | "
+            f"{away_team}: 前試合から{away_days}日"
+        ) if (home_days > 0 or away_days > 0) else "試合間隔データなし"
+
+        # カード規律テキスト（生データ + スコア）
+        home_cards = home_cards or {}
+        away_cards = away_cards or {}
+        p_disc = contributions["parameters"].get("discipline_risk", {})
+        h_yell = home_cards.get("yellow_per_game", "?")
+        h_red  = home_cards.get("red_per_game",   "?")
+        a_yell = away_cards.get("yellow_per_game", "?")
+        a_red  = away_cards.get("red_per_game",   "?")
+        disc_text = (
+            f"{home_team}: イエロー{h_yell}枚/試合 レッド{h_red}枚/試合 "
+            f"→ 規律スコア{p_disc.get('home_score', 0.6):.3f}\n"
+            f"{away_team}: イエロー{a_yell}枚/試合 レッド{a_red}枚/試合 "
+            f"→ 規律スコア{p_disc.get('away_score', 0.6):.3f}"
+        )
+
+        # 怪我人テキスト（生データ + スコア）
+        home_injuries = home_injuries or []
+        away_injuries = away_injuries or []
+        p_att = contributions["parameters"].get("attrition_rate", {})
+        h_inj_names = [inj.get("player", "不明") for inj in home_injuries[:5]]
+        a_inj_names = [inj.get("player", "不明") for inj in away_injuries[:5]]
+        inj_text = (
+            f"{home_team}: 怪我人{len(home_injuries)}名/25スカッド"
+            f"{' (' + ', '.join(h_inj_names) + ')' if h_inj_names else ''}"
+            f" → 損耗スコア{p_att.get('home_score', 0.8):.2f}\n"
+            f"{away_team}: 怪我人{len(away_injuries)}名/25スカッド"
+            f"{' (' + ', '.join(a_inj_names) + ')' if a_inj_names else ''}"
+            f" → 損耗スコア{p_att.get('away_score', 0.8):.2f}"
+        )
+
+        prompt = f"""あなたはJリーグ試合予測の専門AIアナリストです。
+以下の詳細な科学的パラメータ分析を基に、試合結果を予測してください。
+
+## 試合
+ホーム: {home_team} (順位{home_stats.get('順位','?')}位, 勝点{home_stats.get('勝点','?')}, 資本力スコア{h_cap:.2f})
+アウェー: {away_team} (順位{away_stats.get('順位','?')}位, 勝点{away_stats.get('勝点','?')}, 資本力スコア{a_cap:.2f})
+{gk_label}
+
+## 攻撃・守備力 (Dixon-Colesパラメータ)
+{home_team}: 得点率={h_atk_r}/試合, 失点率={h_def_r}/試合
+{away_team}: 得点率={a_atk_r}/試合, 失点率={a_def_r}/試合
+{xg_text}
+
+## コンディション指標 (v3新パラメータ — 生データ付き)
+### 試合間隔・休息
+{interval_text}
+
+### イエローカード累積・規律リスク
+{disc_text}
+
+### 怪我人・損耗率
+{inj_text}
+
+### 資本力 (親会社収益・年俸総額)
+{home_team}: 資本力スコア{h_cap:.2f} (J平均=0.45〜0.55)
+{away_team}: 資本力スコア{a_cap:.2f} (J平均=0.45〜0.55)
+資本差: {capital_diff:+.2f}
+
+## 重み付きパラメータ貢献度（v3 Gemini設計モデル）
+{params_text}
+
+加重合計ホームアドバンテージスコア: {contributions['raw_home_advantage']:+.4f}
+移動距離: {contributions['distance_km']}km (疲労係数: {contributions['travel_fatigue']:.2f})
+
+## 直近フォーム
+{home_team}: {' '.join(home_form)}
+{away_team}: {' '.join(away_form)}
+
+## H2H (過去{h2h.get('total',0)}試合)
+{home_team} {h2h.get('home_wins',0)}勝 / 引分 {h2h.get('draws',0)} / {away_team} {h2h.get('away_wins',0)}勝
+
+## 天気
+{weather.get('description','?')} 気温{weather.get('temp_avg','?')}°C 降水{weather.get('precipitation','?')}mm
+
+## 指示
+上記データを統合分析し、以下のJSON形式のみで回答してください。
+資本力格差がある場合は「ジャイアントキリング確率」を特に精密に算出すること。
+
+{{
+  "home_win_prob": <0-100整数>,
+  "draw_prob": <0-100整数>,
+  "away_win_prob": <0-100整数>,
+  "predicted_score": "<H>-<A>",
+  "confidence": "<high|medium|low>",
+  "reasoning": "<400字以上の日本語分析。資本力差・試合間隔・規律リスク・損耗率を含む全パラメータの寄与を数値付きで論述>",
+  "key_factors": ["<要因1>", "<要因2>", "<要因3>", "<要因4>", "<要因5>"],
+  "upset_risk": <番狂わせリスク 0-100>,
+  "giant_killing_prob": <資本力劣位チームが勝つ確率 0-100。格差なし場合はnull>,
+  "model_notes": "<v3新指標（資本力・規律・損耗率・試合間隔）が予測に与えた影響>"
+}}
+
+home_win_prob + draw_prob + away_win_prob = 100 を厳守。"""
+
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=gtypes.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.25,
+                max_output_tokens=2048,
+            ),
+        )
+
+        raw = resp.text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1].lstrip("json").strip().split("```")[0]
+
+        result = json.loads(raw)
+        result["model"] = "gemini-2.0-flash"
+        result["distance_km"] = contributions["distance_km"]
+        result["contributions"] = contributions["parameters"]
+        _normalize(result)
+        return result
+
+    except Exception as exc:
+        logger.error("Gemini prediction error: %s", exc)
+        h_pct, d_pct, a_pct = advantage_to_probs(contributions["raw_home_advantage"])
+        return _statistical_result(home_team, away_team, h_pct, d_pct, a_pct, contributions)
+
+
+def _normalize(r: dict) -> None:
+    h = int(r.get("home_win_prob", 40))
+    d = int(r.get("draw_prob", 25))
+    a = int(r.get("away_win_prob", 35))
+    t = h + d + a
+    if t != 100 and t > 0:
+        r["home_win_prob"] = round(h / t * 100)
+        r["draw_prob"] = round(d / t * 100)
+        r["away_win_prob"] = 100 - r["home_win_prob"] - r["draw_prob"]
+
+
+def _statistical_result(
+    home: str, away: str,
+    h_pct: int, d_pct: int, a_pct: int,
+    contributions: dict,
+) -> dict:
+    return {
+        "home_win_prob": h_pct,
+        "draw_prob": d_pct,
+        "away_win_prob": a_pct,
+        "predicted_score": "1-1",
+        "confidence": "medium",
+        "reasoning": (
+            f"統計モデル予測（Gemini未使用）\n"
+            f"加重ホームアドバンテージスコア: {contributions['raw_home_advantage']:+.4f}\n"
+            f"移動距離: {contributions['distance_km']}km\n\n"
+            "各パラメータの重み付き合計からシグモイド変換で確率を算出しています。"
+        ),
+        "key_factors": [
+            f"チーム強度差: {contributions['parameters']['team_strength']['home_advantage']:+.3f}",
+            f"資本力差: {contributions['parameters'].get('capital_power',{}).get('home_advantage',0):+.3f}",
+            f"攻撃率差: {contributions['parameters']['attack_rate']['home_advantage']:+.3f}",
+            f"守備率差: {contributions['parameters']['defense_rate']['home_advantage']:+.3f}",
+            f"フォーム差: {contributions['parameters']['recent_form']['home_advantage']:+.3f}",
+            f"xG差分: {contributions['parameters'].get('xg_differential',{}).get('home_advantage',0):+.3f}",
+            f"規律リスク差: {contributions['parameters'].get('discipline_risk',{}).get('home_advantage',0):+.3f}",
+            f"試合間隔: H{contributions.get('home_days',0)}日/A{contributions.get('away_days',0)}日",
+        ],
+        "giant_killing_prob": None,
+        "upset_risk": 30,
+        "model_notes": "Gemini API未設定のため統計モデルのみで予測",
+        "model": "statistical-only",
+        "distance_km": contributions["distance_km"],
+        "contributions": contributions["parameters"],
+    }
