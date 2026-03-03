@@ -507,6 +507,13 @@ def sidebar() -> tuple[str, dict | None]:
 
         st.markdown("---")
         ak = os.getenv("GEMINI_API_KEY", "")
+        if not ak:
+            try:
+                ak = st.secrets.get("GEMINI_API_KEY", "")
+                if ak:
+                    os.environ["GEMINI_API_KEY"] = str(ak)
+            except Exception:
+                pass
         if ak and ak != "your_gemini_api_key_here":
             st.success("Gemini 2.0 Flash 接続済み ✓")
         else:

@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 def _get_gemini_client():
     from google import genai
     api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        try:
+            import streamlit as _st
+            api_key = _st.secrets.get("GEMINI_API_KEY", "")
+            if api_key:
+                os.environ["GEMINI_API_KEY"] = str(api_key)
+        except Exception:
+            pass
     if not api_key or api_key == "your_gemini_api_key_here":
         raise ValueError("GEMINI_API_KEY が設定されていません。.env を確認してください。")
     return genai.Client(api_key=api_key)
