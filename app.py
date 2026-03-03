@@ -41,12 +41,14 @@ from prediction_store import (
 load_dotenv()
 
 # Streamlit Cloud 対応: st.secrets → os.environ に橋渡し（ローカル .env と共存）
-try:
-    for _k, _v in st.secrets.items():
-        if isinstance(_v, str) and _k not in os.environ:
-            os.environ[_k] = _v
-except Exception:
-    pass
+_SECRET_KEYS = ["GEMINI_API_KEY"]
+for _sk in _SECRET_KEYS:
+    try:
+        _sv = st.secrets.get(_sk)
+        if _sv and _sk not in os.environ:
+            os.environ[_sk] = str(_sv)
+    except Exception:
+        pass
 
 logging.basicConfig(level=logging.WARNING)
 
