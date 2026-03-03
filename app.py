@@ -42,14 +42,19 @@ load_dotenv()
 
 # Streamlit Cloud secrets ブリッジ（main()内で呼び出す）
 def _apply_secrets():
-    """st.secrets の内容を os.environ に転写する（Streamlit Cloud 対応）"""
-    for _k in ("GEMINI_API_KEY",):
-        if os.environ.get(_k):
-            continue
+    """st.secrets → os.environ に転写（全アクセスパターンを試す）"""
+    if os.environ.get("GEMINI_API_KEY"):
+        return
+    for _getter in (
+        lambda: st.secrets["GEMINI_API_KEY"],
+        lambda: st.secrets.GEMINI_API_KEY,
+        lambda: dict(st.secrets).get("GEMINI_API_KEY"),
+    ):
         try:
-            _v = st.secrets[_k]
+            _v = _getter()
             if _v:
-                os.environ[_k] = str(_v)
+                os.environ["GEMINI_API_KEY"] = str(_v)
+                return
         except Exception:
             pass
 
@@ -510,6 +515,9 @@ def sidebar() -> tuple[str, dict | None]:
 
         st.markdown("---")
         ak = os.getenv("GEMINI_API_KEY", "")
+        if not ak or ak == "your_gemini_api_key_here":
+            _apply_secrets()
+            ak = os.getenv("GEMINI_API_KEY", "")
         if ak and ak != "your_gemini_api_key_here":
             st.success("Gemini 2.0 Flash 接続済み ✓")
         else:
