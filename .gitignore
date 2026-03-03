@@ -23,6 +23,7 @@ ENV/
 
 # ─── データファイル（ローカルのみ）─────────────────
 data/predictions.json
+!data/.gitkeep
 
 # ─── デバッグ用一時 .txt ────────────────────────────
 /j1_result.txt
