@@ -25,9 +25,14 @@ def _get_gemini_client():
     if not api_key:
         try:
             import streamlit as _st
-            api_key = str(_st.secrets["GEMINI_API_KEY"])
-            if api_key:
-                os.environ["GEMINI_API_KEY"] = api_key
+            for _k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+                try:
+                    api_key = str(_st.secrets[_k])
+                    if api_key:
+                        os.environ["GEMINI_API_KEY"] = api_key
+                        break
+                except Exception:
+                    pass
         except Exception:
             pass
     if not api_key or api_key == "your_gemini_api_key_here":
