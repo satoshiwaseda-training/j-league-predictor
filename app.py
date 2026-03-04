@@ -37,12 +37,21 @@ from prediction_store import (
     delete_prediction as store_delete,
     get_accuracy_stats,
 )
-from scripts.feedback_loop import (
-    analyze_predictions,
-    ask_gemini_for_analysis,
-    ask_gemini_to_implement_indicators,
-    sync_results_to_store,
-)
+try:
+    from scripts.feedback_loop import (
+        analyze_predictions,
+        ask_gemini_for_analysis,
+        ask_gemini_to_implement_indicators,
+        sync_results_to_store,
+    )
+    _FEEDBACK_OK = True
+except Exception as _feedback_err:
+    _FEEDBACK_OK = False
+    _FEEDBACK_ERR_MSG = str(_feedback_err)
+    def analyze_predictions(p): return {}
+    def ask_gemini_for_analysis(*a, **k): return {"error": _FEEDBACK_ERR_MSG}
+    def ask_gemini_to_implement_indicators(*a, **k): return {"error": _FEEDBACK_ERR_MSG}
+    def sync_results_to_store(*a, **k): return (0, 0)
 
 load_dotenv()
 
@@ -524,6 +533,8 @@ def sidebar() -> tuple[str, dict | None]:
             st.success("Gemini 2.0 Flash 接続済み ✓")
         else:
             st.error("Gemini API キー未設定\n`.env` を確認してください")
+        if not _FEEDBACK_OK:
+            st.warning(f"feedback_loop import error:\n{_FEEDBACK_ERR_MSG}")
 
     return division, st.session_state.get("match")
 
