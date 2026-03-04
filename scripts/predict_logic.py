@@ -29,20 +29,22 @@ logger = logging.getLogger(__name__)
 # ─── Gemini v3 設計重み (2026-03-01 第2回設計会議) ─────
 # 重み合計 = 1.00 (Gemini推奨値 + 端数調整)
 MODEL_WEIGHTS: dict[str, float] = {
-    "team_strength":    0.15,  # 勝点・順位差
-    "attack_rate":      0.10,  # 得点率/試合 (Dixon-Coles λ)
-    "defense_rate":     0.08,  # 失点率/試合 (Dixon-Coles μ)
-    "recent_form":      0.18,  # 直近フォームPPG (最信頼性)
-    "xg_differential":  0.08,  # xG差 (FBref J1)
-    "home_advantage":   0.10,  # ホームADV
-    "capital_power":    0.12,  # 新: 資本力 (R²≈0.65-0.72 vs 勝点)
-    "head_to_head":     0.04,  # H2H (Cohen's d小)
-    "discipline_risk":  0.04,  # 新: 規律・カード累積リスク
-    "attrition_rate":   0.04,  # 新: 損耗率 (スカッド比率)
-    "match_interval":   0.04,  # 新: 試合間隔疲労 U字型
-    "injury_impact":    0.02,  # 個別怪我絶対数
-    "weather_fatigue":  0.01,  # 天気疲労 (効果小)
-    "travel_distance":  0.00,  # 移動距離 (J地理圧縮 → 実質0)
+    "team_strength":         0.1400,  # 勝点・順位差
+    "attack_rate":           0.0940,  # 得点率/試合 (Dixon-Coles λ)
+    "defense_rate":          0.0750,  # 失点率/試合 (Dixon-Coles μ)
+    "recent_form":           0.1690,  # 直近フォームPPG (最信頼性)
+    "xg_differential":       0.0750,  # xG差 (FBref J1)
+    "home_advantage":        0.0940,  # ホームADV
+    "capital_power":         0.1130,  # 資本力 (R²≈0.65-0.72 vs 勝点)
+    "head_to_head":          0.0380,  # H2H (Cohen's d小)
+    "discipline_risk":       0.0380,  # 規律・カード累積リスク
+    "attrition_rate":        0.0380,  # 損耗率 (スカッド比率)
+    "match_interval":        0.0380,  # 試合間隔疲労 U字型
+    "injury_impact":         0.0190,  # 個別怪我絶対数
+    "weather_fatigue":       0.0090,  # 天気疲労 (効果小)
+    "travel_distance":       0.0000,  # 移動距離 (J地理圧縮 → 実質0)
+    "set_piece_conversion":  0.0300,  # Gemini提案: セットプレー得点率
+    "match_day_motivation":  0.0300,  # Gemini提案: 試合当日モチベーション
 }
 
 # ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
@@ -215,6 +217,50 @@ def score_match_interval(home_days: int, away_days: int) -> tuple[float, float]:
     return _score(home_days), _score(away_days)
 
 
+def score_set_piece_conversion_rate(
+    home_set_pieces: dict,
+    away_set_pieces: dict,
+) -> tuple[float, float]:
+    """
+    セットプレー得点率スコア (0.0〜1.0, 高いほど良い)
+    Gemini提案 v9: セットプレーからの得点能力 → 試合の流れを変える可能性を評価
+    データなし: 中立値 0.5 を返す
+
+    Parameters: {"attempts": int, "successes": int}
+    """
+    def _score(sp: dict) -> float:
+        if not sp:
+            return 0.5
+        attempts  = float(sp.get("attempts",  0))
+        successes = float(sp.get("successes", 0))
+        if attempts == 0:
+            return 0.5
+        rate = successes / attempts
+        return round(min(1.0, max(0.0, 0.3 + rate * 0.7)), 3)
+
+    return _score(home_set_pieces), _score(away_set_pieces)
+
+
+def score_match_day_motivation(
+    home_motivation: dict,
+    away_motivation: dict,
+) -> tuple[float, float]:
+    """
+    試合当日モチベーションスコア (0.0〜1.0, 高いほど良い)
+    Gemini提案 v9: 選手コメント・SNS・試合文脈から推定されるチームの気勢
+    データなし: 中立値 0.5 を返す
+
+    Parameters: {"level": float}  # 0.0〜1.0 で事前に数値化
+    """
+    def _score(mot: dict) -> float:
+        if not mot:
+            return 0.5
+        level = float(mot.get("level", 0.5))
+        return round(min(1.0, max(0.0, level)), 3)
+
+    return _score(home_motivation), _score(away_motivation)
+
+
 def score_team_strength(home_stats: dict, away_stats: dict) -> tuple[float, float]:
     """
     勝点・順位・得失点差に基づくチーム強度スコア (0.0〜1.0)
@@ -384,6 +430,10 @@ def calculate_parameter_contributions(
     away_cards: dict | None = None,
     home_days: int = 0,                   # 試合間隔 (日数)
     away_days: int = 0,
+    home_set_pieces: dict | None = None,  # Gemini提案: セットプレー統計
+    away_set_pieces: dict | None = None,
+    home_motivation: dict | None = None,  # Gemini提案: 試合当日モチベーション
+    away_motivation: dict | None = None,
 ) -> dict[str, Any]:
     """
     各パラメータのホーム有利度スコアと重み付き貢献度を計算。
@@ -432,6 +482,12 @@ def calculate_parameter_contributions(
     a_weather           = 1.0 - h_weather + 0.45
     h_travel            = 1.0
     a_travel            = 1.0 - travel_fat
+    h_setp, a_setp      = score_set_piece_conversion_rate(
+                              home_set_pieces or {}, away_set_pieces or {}
+                          )
+    h_motiv, a_motiv    = score_match_day_motivation(
+                              home_motivation or {}, away_motivation or {}
+                          )
 
     params: dict[str, dict] = {}
     raw_adv = 0.0
@@ -449,8 +505,10 @@ def calculate_parameter_contributions(
         ("attrition_rate",  h_att,      a_att),
         ("match_interval",  h_interval, a_interval),
         ("injury_impact",   h_inj,      a_inj),
-        ("weather_fatigue", h_weather,  a_weather),
-        ("travel_distance", h_travel,   a_travel),
+        ("weather_fatigue",        h_weather,  a_weather),
+        ("travel_distance",        h_travel,   a_travel),
+        ("set_piece_conversion",   h_setp,     a_setp),
+        ("match_day_motivation",   h_motiv,    a_motiv),
     ]:
         adv = round(h_score - a_score, 3)
         w = MODEL_WEIGHTS[name]
