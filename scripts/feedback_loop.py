@@ -240,7 +240,170 @@ def ask_gemini_for_analysis(
 
 
 # ─────────────────────────────────────────────
-# 3. シーズンバックテスト用ユーティリティ
+# 3. 新指標の自動実装コード生成
+# ─────────────────────────────────────────────
+
+_SCORE_FUNC_EXAMPLE = '''
+def score_discipline_risk(home_cards: dict, away_cards: dict) -> tuple[float, float]:
+    """規律リスクスコア (0.0〜1.0, 高いほど安定)"""
+    def _score(cards: dict) -> float:
+        if not cards:
+            return 0.60
+        yell_pg = float(cards.get("yellow_per_game", 1.8))
+        red_pg  = float(cards.get("red_per_game", 0.05))
+        penalty = 0.0
+        if yell_pg > 2.5:   penalty += 0.25
+        elif yell_pg > 2.0: penalty += 0.15
+        elif yell_pg > 1.5: penalty += 0.06
+        penalty += red_pg * 3.0
+        return round(max(0.10, 0.78 - penalty), 3)
+    return _score(home_cards), _score(away_cards)
+
+
+def score_match_interval(home_days: int, away_days: int) -> tuple[float, float]:
+    """試合間隔疲労スコア U字型 (0.0〜1.0)"""
+    def _score(days: int) -> float:
+        if days == 0: return 0.52
+        if days <= 2: return 0.40
+        if days == 3: return 0.45
+        if days <= 5: return 0.53
+        if days <= 7: return 0.55
+        if days <= 10: return 0.48
+        return 0.47
+    return _score(home_days), _score(away_days)
+'''
+
+_INTEGRATION_EXAMPLE = '''
+# calculate_parameter_contributions() 内の各スコア計算ブロック:
+h_disc, a_disc = score_discipline_risk(home_cards or {}, away_cards or {})
+h_interval, a_interval = score_match_interval(home_days, away_days)
+
+# params リストへの追加:
+("discipline_risk", h_disc,     a_disc),
+("match_interval",  h_interval, a_interval),
+'''
+
+
+def ask_gemini_to_implement_indicators(
+    indicators:      list[dict],
+    current_weights: dict[str, float],
+) -> dict:
+    """
+    Gemini に新指標のスコア関数・重み更新・統合コードを生成させる。
+
+    Returns:
+        {
+          "score_functions": [{"name": str, "code": str, "docstring": str}],
+          "updated_weights": {param: float, ...},  # 合計1.00
+          "integration_snippet": str,              # calculate_parameter_contributions に追加する行
+          "updated_predict_logic": str,            # predict_logic.py の差分説明
+          "error": str | None,
+        }
+    """
+    api_key = _resolve_api_key()
+    if not api_key:
+        return {"error": "GEMINI_API_KEY 未設定", "score_functions": [],
+                "updated_weights": {}, "integration_snippet": ""}
+
+    ind_text = "\n".join(
+        f"  {i+1}. 指標名: {ind['name']}\n"
+        f"     説明: {ind['description']}\n"
+        f"     期待効果: {ind.get('expected_impact','')}"
+        for i, ind in enumerate(indicators)
+    )
+
+    weights_text = "\n".join(
+        f"  \"{k}\": {v:.2f}," for k, v in current_weights.items()
+    )
+    weight_sum = sum(current_weights.values())
+    budget = round(1.0 - weight_sum, 3)  # 新指標に割り当て可能な重み予算（通常0だが端数考慮）
+
+    prompt = f"""あなたはJリーグ予測モデルのPythonエンジニアです。
+以下の新指標を predict_logic.py に実装してください。
+
+## 追加する新指標
+{ind_text}
+
+## 現在のMODEL_WEIGHTS
+{{
+{weights_text}
+}}
+現在の合計: {weight_sum:.2f}
+
+## 既存コードの規則（必ず従うこと）
+1. スコア関数はすべて (home_score, away_score) -> tuple[float, float] を返す
+2. スコアは 0.0〜1.0 の範囲
+3. データが取得できない場合は中立値（0.5前後）を返す
+4. calculate_parameter_contributions() 内で呼び出す
+
+## 既存スコア関数の実装例（参考）
+{_SCORE_FUNC_EXAMPLE}
+
+## 統合パターン（参考）
+{_INTEGRATION_EXAMPLE}
+
+## タスク
+1. 各新指標の `score_{{指標名}}(home_data, away_data)` 関数を実装せよ
+2. 新指標に合わせて MODEL_WEIGHTS を更新せよ（合計が必ず1.00になること）
+   - 新指標それぞれに 0.02〜0.04 程度の重みを割り当て
+   - 既存の重みを比例縮小して調整
+3. calculate_parameter_contributions() に追加すべき統合コードを書け
+
+必ず以下のJSON形式のみで回答せよ（説明文は不要）:
+{{
+  "score_functions": [
+    {{
+      "name": "score_{{指標名}}",
+      "args": "home_xxx: dict, away_xxx: dict",
+      "code": "完全なPython関数コード（def行からreturnまで）",
+      "data_note": "この関数に渡すべきデータの取得方法の説明"
+    }}
+  ],
+  "updated_weights": {{
+    "team_strength": 0.00,
+    ... (全パラメータ、合計=1.00)
+  }},
+  "integration_snippet": "calculate_parameter_contributions内に追加するPythonコード（複数行）",
+  "summary": "実装した指標の概要と期待される精度向上（日本語）"
+}}"""
+
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "temperature": 0.25,
+            },
+        )
+        result = json.loads(response.text)
+        result["error"] = None
+        result["generated_at"] = datetime.now().isoformat()
+        # 重みの合計を検証・補正
+        uw = result.get("updated_weights", {})
+        if uw:
+            total = sum(uw.values())
+            if abs(total - 1.0) > 0.005:
+                # 比例正規化
+                result["updated_weights"] = {k: round(v / total, 4) for k, v in uw.items()}
+                result["weight_normalized"] = True
+        return result
+    except Exception as e:
+        logger.error("Gemini implement indicators failed: %s", e)
+        return {
+            "error": str(e),
+            "score_functions": [],
+            "updated_weights": {},
+            "integration_snippet": "",
+            "summary": f"生成失敗: {e}",
+            "generated_at": datetime.now().isoformat(),
+        }
+
+
+# ─────────────────────────────────────────────
+# 4. シーズンバックテスト用ユーティリティ
 # ─────────────────────────────────────────────
 
 def sync_results_to_store(division: str = "j1") -> tuple[int, int]:
