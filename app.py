@@ -521,7 +521,11 @@ def sidebar() -> tuple[str, dict | None]:
         if ak and ak != "your_gemini_api_key_here":
             st.success("Gemini 2.0 Flash 接続済み ✓")
         else:
-            st.error("Gemini API キー未設定\n`.env` を確認してください")
+            try:
+                _sk = list(st.secrets.keys())
+            except Exception as _e:
+                _sk = f"err:{type(_e).__name__}"
+            st.error(f"Gemini API キー未設定\nsecrets keys: {_sk}")
 
     return division, st.session_state.get("match")
 
