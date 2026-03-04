@@ -37,6 +37,12 @@ from prediction_store import (
     delete_prediction as store_delete,
     get_accuracy_stats,
 )
+from scripts.feedback_loop import (
+    analyze_predictions,
+    ask_gemini_for_analysis,
+    ask_gemini_to_implement_indicators,
+    sync_results_to_store,
+)
 
 load_dotenv()
 
@@ -1460,7 +1466,6 @@ def render_history(division: str = "j1"):
         st.plotly_chart(pie_fig, width="stretch")
 
         # ── カテゴリ別正答率棒グラフ ──────────────────────────────
-        from scripts.feedback_loop import analyze_predictions
         analysis = analyze_predictions(preds)
         by_out = analysis.get("by_outcome", {})
         if any(v.get("accuracy") is not None for v in by_out.values()):
@@ -1510,8 +1515,6 @@ def render_history(division: str = "j1"):
             help="不正解が1件以上必要です" if gen_disabled else "",
         ):
             with st.spinner("Gemini 2.0 Flash が分析中..."):
-                from scripts.feedback_loop import ask_gemini_for_analysis
-                from scripts.predict_logic import MODEL_WEIGHTS
                 report = ask_gemini_for_analysis(wrong_preds, preds, MODEL_WEIGHTS)
                 st.session_state["feedback_report"] = report
 
@@ -1519,7 +1522,6 @@ def render_history(division: str = "j1"):
         if st.button("🔄 実結果を自動同期", use_container_width=True,
                      help="jleague.jp から実スコアを取得し未入力予測に自動入力します"):
             with st.spinner("実結果を同期中..."):
-                from scripts.feedback_loop import sync_results_to_store
                 synced, skipped = sync_results_to_store(division)
             st.success(f"同期完了: {synced}件 入力 / {skipped}件 スキップ")
             st.rerun()
@@ -1588,8 +1590,6 @@ def render_history(division: str = "j1"):
                     key="btn_auto_implement",
                 ):
                     with st.spinner("Gemini 2.0 Flash が実装コードを生成中..."):
-                        from scripts.feedback_loop import ask_gemini_to_implement_indicators
-                        from scripts.predict_logic import MODEL_WEIGHTS
                         impl = ask_gemini_to_implement_indicators(new_inds, MODEL_WEIGHTS)
                         st.session_state["impl_result"] = impl
 
