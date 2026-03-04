@@ -1127,6 +1127,69 @@ def calc_match_interval(
 # 怪我・出場停止情報
 # ─────────────────────────────────────────────
 
+def get_match_stats(home: str, away: str, date: str, division: str = "j1") -> dict | None:
+    """
+    特定試合の結果＋スタッツを返す。
+    スコア・勝者は get_past_results() から照合。
+    シュート数・支配率は jleague.jp 試合詳細ページから取得を試みる。
+    Returns: {"score": "H-A", "home_score": int, "away_score": int,
+              "winner": "home"|"draw"|"away",
+              "home_shots": int|None, "away_shots": int|None,
+              "home_possession": int|None, "away_possession": int|None}
+    """
+    # 1) 過去結果リストから基本スコアを探す
+    past = get_past_results(division)
+    base: dict | None = None
+    for r in past:
+        if r["home"] == home and r["away"] == away and r["date"] == date:
+            base = r.copy()
+            break
+    if not base:
+        return None
+
+    # 2) 試合詳細ページからシュート・支配率を取得
+    url_key = _league_url_key(division)
+    sec = base.get("section", 1)
+    sec_url = f"{BASE_URL}/match/section/{url_key}/{sec}/"
+    soup = _get(sec_url)
+    home_shots = away_shots = home_poss = away_poss = None
+
+    if soup:
+        for row in soup.find_all("tr"):
+            clubs = row.find_all(class_="clubName")
+            if len(clubs) < 2:
+                continue
+            h_s = _normalize_team(clubs[0].get_text(strip=True))
+            a_s = _normalize_team(clubs[1].get_text(strip=True))
+            if h_s != home or a_s != away:
+                continue
+            # シュート数（shootNum クラス or 類似）
+            shots = row.find_all(class_=re.compile(r"shoot|shot", re.I))
+            if len(shots) >= 2:
+                try:
+                    home_shots = int(shots[0].get_text(strip=True))
+                    away_shots = int(shots[1].get_text(strip=True))
+                except ValueError:
+                    pass
+            # 支配率（possession クラス）
+            poss = row.find_all(class_=re.compile(r"possess", re.I))
+            if len(poss) >= 2:
+                try:
+                    home_poss = int(re.sub(r"[^0-9]", "", poss[0].get_text()))
+                    away_poss = int(re.sub(r"[^0-9]", "", poss[1].get_text()))
+                except ValueError:
+                    pass
+            break
+
+    base.update({
+        "home_shots":      home_shots,
+        "away_shots":      away_shots,
+        "home_possession": home_poss,
+        "away_possession": away_poss,
+    })
+    return base
+
+
 def get_injury_news(team_name: str) -> list[dict]:
     """
     怪我・出場停止情報をニュースから取得（近似）。

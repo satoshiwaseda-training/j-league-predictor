@@ -1459,6 +1459,137 @@ def render_history(division: str = "j1"):
         pie_fig.update_traces(textfont_color="#ffffff")
         st.plotly_chart(pie_fig, width="stretch")
 
+        # ── カテゴリ別正答率棒グラフ ──────────────────────────────
+        from scripts.feedback_loop import analyze_predictions
+        analysis = analyze_predictions(preds)
+        by_out = analysis.get("by_outcome", {})
+        if any(v.get("accuracy") is not None for v in by_out.values()):
+            outcome_labels = {"home": "ホーム勝利予測", "draw": "ドロー予測", "away": "アウェー勝利予測"}
+            bar_data = [
+                {"カテゴリ": outcome_labels.get(k, k),
+                 "正答率(%)": round(v["accuracy"] * 100, 1) if v["accuracy"] is not None else 0,
+                 "予測数": v["predicted"]}
+                for k, v in by_out.items() if v["predicted"] > 0
+            ]
+            if bar_data:
+                bar_fig = go.Figure(go.Bar(
+                    x=[d["カテゴリ"] for d in bar_data],
+                    y=[d["正答率(%)"] for d in bar_data],
+                    text=[f"{d['正答率(%)']}%<br>({d['予測数']}試合)" for d in bar_data],
+                    textposition="outside",
+                    marker_color=["#3b82f6", "#f59e0b", "#ef4444"],
+                ))
+                bar_fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    yaxis=dict(range=[0, 110], ticksuffix="%", gridcolor="#e2e8f0"),
+                    xaxis=dict(gridcolor="rgba(0,0,0,0)"),
+                    margin=dict(l=0, r=0, t=10, b=0), height=260,
+                    showlegend=False,
+                )
+                st.plotly_chart(bar_fig, use_container_width=True)
+
+    # ── Gemini 今週の反省・改善案 ──────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 🤖 Gemini 反省レポート & 重み調整提案")
+    st.caption("不正解試合を Gemini 2.0 Flash が分析し、モデル改善案を提案します。")
+
+    wrong_preds = [
+        p for p in preds
+        if p.get("actual") and p["actual"].get("winner")
+        and p["actual"]["winner"] != p["prediction"].get("pred_winner")
+    ]
+
+    col_gen, col_sync = st.columns([2, 2])
+    with col_gen:
+        gen_disabled = len(wrong_preds) == 0
+        if st.button(
+            "🔍 Gemini で敗因分析を実行",
+            type="primary",
+            use_container_width=True,
+            disabled=gen_disabled,
+            help="不正解が1件以上必要です" if gen_disabled else "",
+        ):
+            with st.spinner("Gemini 2.0 Flash が分析中..."):
+                from scripts.feedback_loop import ask_gemini_for_analysis
+                from scripts.predict_logic import MODEL_WEIGHTS
+                report = ask_gemini_for_analysis(wrong_preds, preds, MODEL_WEIGHTS)
+                st.session_state["feedback_report"] = report
+
+    with col_sync:
+        if st.button("🔄 実結果を自動同期", use_container_width=True,
+                     help="jleague.jp から実スコアを取得し未入力予測に自動入力します"):
+            with st.spinner("実結果を同期中..."):
+                from scripts.feedback_loop import sync_results_to_store
+                synced, skipped = sync_results_to_store(division)
+            st.success(f"同期完了: {synced}件 入力 / {skipped}件 スキップ")
+            st.rerun()
+
+    # レポート表示
+    report = st.session_state.get("feedback_report")
+    if report:
+        if report.get("error"):
+            st.error(f"分析エラー: {report['error']}")
+        else:
+            gen_at = report.get("generated_at", "")[:16].replace("T", " ")
+            st.caption(f"生成日時: {gen_at}")
+
+            # 敗因
+            causes = report.get("defeat_causes", [])
+            if causes:
+                st.markdown("**敗因分析**")
+                for i, c in enumerate(causes, 1):
+                    st.markdown(
+                        f'<div style="background:#fef9c3;border-left:4px solid #f59e0b;'
+                        f'padding:0.5rem 0.8rem;margin:0.3rem 0;border-radius:4px;'
+                        f'font-size:0.9rem;color:#78350f;">⚠️ {i}. {c}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # 重み調整提案
+            adjustments = report.get("weight_adjustments", [])
+            if adjustments:
+                st.markdown("**重み調整提案**")
+                adj_rows = []
+                for a in adjustments:
+                    cur = a.get("current", 0)
+                    sug = a.get("suggested", 0)
+                    diff = sug - cur
+                    arrow = "⬆️" if diff > 0 else "⬇️"
+                    adj_rows.append({
+                        "パラメータ": a.get("param", ""),
+                        "現在値": f"{cur:.2f}",
+                        "提案値": f"{sug:.2f}",
+                        "変化": f"{arrow} {diff:+.2f}",
+                        "理由": a.get("reason", ""),
+                    })
+                st.dataframe(pd.DataFrame(adj_rows), hide_index=True, use_container_width=True)
+
+            # 新指標提案
+            new_inds = report.get("new_indicators", [])
+            if new_inds:
+                st.markdown("**新指標提案**")
+                for ind in new_inds:
+                    st.markdown(
+                        f'<div style="background:#f0fdf4;border-left:4px solid #16a34a;'
+                        f'padding:0.5rem 0.8rem;margin:0.3rem 0;border-radius:4px;font-size:0.9rem;">'
+                        f'<strong style="color:#15803d;">💡 {ind.get("name","")}</strong>: '
+                        f'{ind.get("description","")}'
+                        f'<br><span style="color:#64748b;font-size:0.8rem;">'
+                        f'期待効果: {ind.get("expected_impact","")}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # 総評
+            summary = report.get("summary", "")
+            if summary:
+                st.info(f"**総評**: {summary}")
+    elif len(wrong_preds) == 0 and preds:
+        st.success("不正解予測なし！すべて的中しています。")
+    elif not preds:
+        pass
+    else:
+        st.caption(f"不正解: {len(wrong_preds)}試合。「Gemini で敗因分析を実行」ボタンで分析できます。")
+
 
 # ─── 順位表タブ ───────────────────────────────────────────
 
