@@ -522,7 +522,11 @@ def sidebar() -> tuple[str, dict | None]:
 
         if st.button("🔄 データ更新", use_container_width=True):
             st.cache_data.clear()
+            # 全試合予測キャッシュ（session_state）も全クリア
+            for k in [k for k in st.session_state if k.startswith("all_preds_")]:
+                del st.session_state[k]
             st.success("更新しました")
+            st.rerun()
 
         st.markdown("---")
         ak = os.getenv("GEMINI_API_KEY", "")

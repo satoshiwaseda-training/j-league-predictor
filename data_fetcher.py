@@ -489,49 +489,74 @@ def _normalize_team(short: str) -> str:
 def get_upcoming_matches(division: str = "j1", weeks_ahead: int = 2) -> list[dict]:
     """
     直近の試合カードを取得。
-    J1: /match/search/j1/latest/ を直接パース。
-    J2/J3: 2026年から j2j3 統合リーグのため /match/search/j2j3/?year=2026&section=latest を使用。
-    全試合終了済みの場合はナビリンクの次節を追加取得。
-    返り値: 最直近の試合日ラウンド（3日以内）に絞ったリスト
+    戦略:
+      1. latest URL でナビリンクから現在節番号を特定
+      2. 現在節の節ページ (/match/section/{key}/{n}/) を直接取得 → 全日程分を確実に取得
+      3. latest URL の結果もマージ（節ページ失敗時のフォールバック）
+      4. 今日以降の試合がなければ次節も取得
+    返り値: 最直近の試合日から6日以内（同一節の週末全試合）
     """
     today = datetime.now().strftime("%Y-%m-%d")
     url_key = _league_url_key(division)
 
-    matches: list[dict] = []
+    # 重複防止用
+    seen_keys: set[tuple] = set()
+    all_matches: list[dict] = []
 
-    # Step1: 最新試合ページを直接パース
+    def _add(new_matches: list[dict]) -> None:
+        for m in new_matches:
+            key = (m["date"], m["home"], m["away"])
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_matches.append(m)
+
+    # Step1: 最新試合ページを取得（ナビリンク取得も兼ねる）
     if url_key == "j2j3":
-        # j2j3 は year パラメータが必要
         latest_url = f"{BASE_URL}/match/search/j2j3/?year=2026&section=latest"
     else:
         latest_url = f"{BASE_URL}/match/search/{url_key}/latest/"
 
     latest_soup = _get(latest_url)
     if latest_soup:
-        matches.extend(_parse_section_matches(latest_soup, division))
+        _add(_parse_section_matches(latest_soup, division))
 
-    # Step2: 今日以降の試合がなければナビの次節を取得
-    upcoming = [m for m in matches if m.get("date", "9999") >= today]
+        # Step2: ナビリンクから現在節を特定し、節ページを直接取得
+        # nav構造: [前節リンク, 次節リンク] → max が次節 → max-1 が現在節
+        section_nums: list[int] = []
+        for a in latest_soup.find_all("a", href=True):
+            m_nav = re.search(rf"/match/section/{url_key}/(\d+)/", a["href"])
+            if m_nav:
+                section_nums.append(int(m_nav.group(1)))
+        if len(section_nums) >= 1:
+            current_sec = max(section_nums) - 1
+            if current_sec >= 1:
+                logger.debug("現在節取得: section %d", current_sec)
+                sec_soup = _get(f"{BASE_URL}/match/section/{url_key}/{current_sec}/")
+                if sec_soup:
+                    _add(_parse_section_matches(sec_soup, division))
+
+    # Step3: 今日以降の試合がなければナビの次節を取得
+    upcoming = [m for m in all_matches if m.get("date", "9999") >= today]
     if not upcoming and latest_soup:
         next_sec = _find_next_section_from_nav(latest_soup, url_key)
         if next_sec:
             sec_soup = _get(f"{BASE_URL}/match/section/{url_key}/{next_sec}/")
             if sec_soup:
-                matches.extend(_parse_section_matches(sec_soup, division))
-        upcoming = [m for m in matches if m.get("date", "9999") >= today]
+                _add(_parse_section_matches(sec_soup, division))
+        upcoming = [m for m in all_matches if m.get("date", "9999") >= today]
 
     if not upcoming:
         logger.warning("match scrape failed – using generated sample")
-        matches = _generate_sample_matches(division, weeks_ahead)
-        upcoming = [m for m in matches if m.get("date", "9999") >= today]
+        sample = _generate_sample_matches(division, weeks_ahead)
+        upcoming = [m for m in sample if m.get("date", "9999") >= today]
 
     if not upcoming:
         return []
 
-    # 最直近の試合日 + 3日以内（同一ラウンド週末）のみ返す
+    # 最直近の試合日から6日以内（同一節の週末全試合をカバー）
     nearest = min(m["date"] for m in upcoming)
     nearest_dt = datetime.strptime(nearest, "%Y-%m-%d")
-    round_end = (nearest_dt + timedelta(days=3)).strftime("%Y-%m-%d")
+    round_end = (nearest_dt + timedelta(days=6)).strftime("%Y-%m-%d")
     return [m for m in upcoming if m["date"] <= round_end]
 
 
@@ -552,19 +577,24 @@ def _find_next_section_from_nav(soup: BeautifulSoup, url_key: str) -> int | None
 def _parse_section_matches(soup: BeautifulSoup, division: str) -> list[dict]:
     """
     節別ページ (/match/section/{div}/{n}/) から試合リストを抽出。
-    構造: matchlistWrap > [timeStamp, matchTable, ...] のペア
+    構造: matchlistWrap > [timeStamp, matchTable, ...] のペア（複数日分が別の matchlistWrap になる場合あり）
     """
     from venues import get_venue_info
 
-    ml = soup.find(class_="matchlistWrap")
-    if not ml:
+    # 複数日（土・日など）が別々の matchlistWrap に分かれる場合があるため find_all で全取得
+    all_mls = soup.find_all(class_="matchlistWrap")
+    if not all_mls:
         return []
 
-    timestamps = ml.find_all(class_="timeStamp")
-    match_tables = ml.find_all(class_="matchTable")
+    # 全 matchlistWrap から timeStamp・matchTable ペアを収集
+    all_pairs: list[tuple] = []
+    for ml in all_mls:
+        timestamps = ml.find_all(class_="timeStamp")
+        match_tables = ml.find_all(class_="matchTable")
+        all_pairs.extend(zip(timestamps, match_tables))
 
     matches: list[dict] = []
-    for ts, mt in zip(timestamps, match_tables):
+    for ts, mt in all_pairs:
         # 日付パース: "2026年3月7日(土)"
         date_text = ts.get_text(" ", strip=True)
         dm = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", date_text)
