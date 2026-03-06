@@ -77,10 +77,10 @@ _FBREF_NAME_MAP: dict[str, str] = {
 # 内部ユーティリティ
 # ─────────────────────────────────────────────
 
-def _get(url: str) -> BeautifulSoup | None:
+def _get(url: str, timeout: int = TIMEOUT) -> BeautifulSoup | None:
     """HTTP GET してパース済み BeautifulSoup を返す。失敗時は None"""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
         resp.raise_for_status()
         # apparent_encoding はWindows環境でShift-JIS誤検出するため、
         # バイト列から直接UTF-8デコードする
@@ -489,17 +489,13 @@ def _normalize_team(short: str) -> str:
 def get_upcoming_matches(division: str = "j1", weeks_ahead: int = 2) -> list[dict]:
     """
     直近の試合カードを取得。
-    戦略:
-      1. latest URL でナビリンクから現在節番号を特定
-      2. 現在節の節ページ (/match/section/{key}/{n}/) を直接取得 → 全日程分を確実に取得
-      3. latest URL の結果もマージ（節ページ失敗時のフォールバック）
-      4. 今日以降の試合がなければ次節も取得
+    J1: latest URL → nav から現在節番号を特定 → 節ページ直取得
+    J2J3: latest URL が巨大でタイムアウトするため節ページを直接順次探索
     返り値: 最直近の試合日から6日以内（同一節の週末全試合）
     """
     today = datetime.now().strftime("%Y-%m-%d")
     url_key = _league_url_key(division)
 
-    # 重複防止用
     seen_keys: set[tuple] = set()
     all_matches: list[dict] = []
 
@@ -510,40 +506,40 @@ def get_upcoming_matches(division: str = "j1", weeks_ahead: int = 2) -> list[dic
                 seen_keys.add(key)
                 all_matches.append(m)
 
-    # Step1: 最新試合ページを取得（ナビリンク取得も兼ねる）
     if url_key == "j2j3":
-        latest_url = f"{BASE_URL}/match/search/j2j3/?year=2026&section=latest"
+        # j2j3 latest URL は全節分(30+日)を返すため重すぎる。
+        # 節ページ (/match/section/j2j3/N/) を直接探索して今日以降の試合を取得する。
+        _add(_fetch_j2j3_upcoming(division, today))
     else:
+        # J1: latest URL でナビリンク取得 → 現在節ページも直取得してマージ
         latest_url = f"{BASE_URL}/match/search/{url_key}/latest/"
+        latest_soup = _get(latest_url)
+        if latest_soup:
+            _add(_parse_section_matches(latest_soup, division))
+            # nav から現在節 (next-1) を特定して節ページも取得
+            section_nums: list[int] = []
+            for a in latest_soup.find_all("a", href=True):
+                m_nav = re.search(rf"/match/section/{url_key}/(\d+)/", a["href"])
+                if m_nav:
+                    section_nums.append(int(m_nav.group(1)))
+            if section_nums:
+                current_sec = max(section_nums) - 1
+                if current_sec >= 1:
+                    logger.debug("現在節取得: section %d", current_sec)
+                    sec_soup = _get(f"{BASE_URL}/match/section/{url_key}/{current_sec}/")
+                    if sec_soup:
+                        _add(_parse_section_matches(sec_soup, division))
 
-    latest_soup = _get(latest_url)
-    if latest_soup:
-        _add(_parse_section_matches(latest_soup, division))
-
-        # Step2: ナビリンクから現在節を特定し、節ページを直接取得
-        # nav構造: [前節リンク, 次節リンク] → max が次節 → max-1 が現在節
-        section_nums: list[int] = []
-        for a in latest_soup.find_all("a", href=True):
-            m_nav = re.search(rf"/match/section/{url_key}/(\d+)/", a["href"])
-            if m_nav:
-                section_nums.append(int(m_nav.group(1)))
-        if len(section_nums) >= 1:
-            current_sec = max(section_nums) - 1
-            if current_sec >= 1:
-                logger.debug("現在節取得: section %d", current_sec)
-                sec_soup = _get(f"{BASE_URL}/match/section/{url_key}/{current_sec}/")
+        # 今日以降がなければ次節を取得
+        upcoming_tmp = [m for m in all_matches if m.get("date", "9999") >= today]
+        if not upcoming_tmp and latest_soup:
+            next_sec = _find_next_section_from_nav(latest_soup, url_key)
+            if next_sec:
+                sec_soup = _get(f"{BASE_URL}/match/section/{url_key}/{next_sec}/")
                 if sec_soup:
                     _add(_parse_section_matches(sec_soup, division))
 
-    # Step3: 今日以降の試合がなければナビの次節を取得
     upcoming = [m for m in all_matches if m.get("date", "9999") >= today]
-    if not upcoming and latest_soup:
-        next_sec = _find_next_section_from_nav(latest_soup, url_key)
-        if next_sec:
-            sec_soup = _get(f"{BASE_URL}/match/section/{url_key}/{next_sec}/")
-            if sec_soup:
-                _add(_parse_section_matches(sec_soup, division))
-        upcoming = [m for m in all_matches if m.get("date", "9999") >= today]
 
     if not upcoming:
         logger.warning("match scrape failed – using generated sample")
@@ -558,6 +554,49 @@ def get_upcoming_matches(division: str = "j1", weeks_ahead: int = 2) -> list[dic
     nearest_dt = datetime.strptime(nearest, "%Y-%m-%d")
     round_end = (nearest_dt + timedelta(days=6)).strftime("%Y-%m-%d")
     return [m for m in upcoming if m["date"] <= round_end]
+
+
+def _fetch_j2j3_upcoming(division: str, today: str) -> list[dict]:
+    """
+    j2j3 節ページを順次探索して今日以降の試合を返す。
+    シーズン開幕(2026-02-01)からの経過週数で開始節を推定し、
+    最大4節分を試みる。
+    """
+    url_key = "j2j3"
+    # 経過週数から開始節を推定（早めの節から試す）
+    from datetime import date as _date
+    season_start = _date(2026, 2, 1)
+    today_date = _date.fromisoformat(today)
+    weeks_elapsed = max(0, (today_date - season_start).days // 7)
+    start_sec = max(1, weeks_elapsed)  # やや早い節から探索開始
+
+    seen_keys: set[tuple] = set()
+    result: list[dict] = []
+
+    for sec in range(start_sec, start_sec + 5):
+        soup = _get(f"{BASE_URL}/match/section/{url_key}/{sec}/", timeout=25)
+        if not soup:
+            continue
+        matches = _parse_section_matches(soup, division)
+        upcoming = [m for m in matches if m.get("date", "9999") >= today]
+        if upcoming:
+            for m in upcoming:
+                key = (m["date"], m["home"], m["away"])
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    result.append(m)
+            # 次の節も取得（週をまたぐ場合）
+            next_soup = _get(f"{BASE_URL}/match/section/{url_key}/{sec + 1}/", timeout=25)
+            if next_soup:
+                for m in _parse_section_matches(next_soup, division):
+                    key = (m["date"], m["home"], m["away"])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        result.append(m)
+            break
+        logger.debug("j2j3 section %d: 全試合終了済み、次節へ", sec)
+
+    return result
 
 
 def _find_next_section_from_nav(soup: BeautifulSoup, url_key: str) -> int | None:
