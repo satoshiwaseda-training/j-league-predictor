@@ -37,10 +37,7 @@ def _get_gemini_client():
             pass
     if not api_key or api_key == "your_gemini_api_key_here":
         raise ValueError("GEMINI_API_KEY が設定されていません。.env を確認してください。")
-    return genai.Client(
-        api_key=api_key,
-        http_options={"timeout": 120},
-    )
+    return genai.Client(api_key=api_key)
 
 
 # ─────────────────────────────────────────────
@@ -94,7 +91,6 @@ def predict_match(
                 response_mime_type="application/json",
                 temperature=0.3,
                 max_output_tokens=2048,
-                thinking_config=_genai.types.ThinkingConfig(thinking_budget=0),
             ),
         )
         raw = response.text.strip()
