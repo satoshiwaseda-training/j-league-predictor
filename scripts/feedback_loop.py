@@ -214,17 +214,19 @@ def ask_gemini_for_analysis(
 
     try:
         from google import genai
+        from google.genai import types as _gtypes
         client = genai.Client(
             api_key=api_key,
-            http_options={"timeout": 60},  # 60秒でタイムアウト（長文JSON生成に対応）
+            http_options={"timeout": 120},
         )
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "temperature": 0.35,
-            },
+            config=_gtypes.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.35,
+                thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
+            ),
         )
         result = json.loads(response.text)
         result["error"] = None
@@ -372,17 +374,19 @@ def ask_gemini_to_implement_indicators(
 
     try:
         from google import genai
+        from google.genai import types as _gtypes
         client = genai.Client(
             api_key=api_key,
-            http_options={"timeout": 60},  # 60秒でタイムアウト（長文JSON生成に対応）
+            http_options={"timeout": 120},
         )
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "temperature": 0.25,
-            },
+            config=_gtypes.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.25,
+                thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
+            ),
         )
         result = json.loads(response.text)
         result["error"] = None
