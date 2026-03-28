@@ -87,7 +87,9 @@ def predict_match(
         client = _get_gemini_client()
         from google import genai as _genai
 
-        response = client.models.generate_content(
+        # ストリーミングで受信（read_timeout を回避）
+        _chunks: list[str] = []
+        for _chunk in client.models.generate_content_stream(
             model="gemini-2.5-flash",
             contents=prompt,
             config=_genai.types.GenerateContentConfig(
@@ -96,8 +98,10 @@ def predict_match(
                 max_output_tokens=2048,
                 thinking_config=_genai.types.ThinkingConfig(thinking_budget=0),
             ),
-        )
-        raw = response.text.strip()
+        ):
+            if _chunk.text:
+                _chunks.append(_chunk.text)
+        raw = "".join(_chunks).strip()
         # JSON ブロックを抽出
         if "```json" in raw:
             raw = raw.split("```json")[1].split("```")[0].strip()

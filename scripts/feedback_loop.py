@@ -219,7 +219,9 @@ def ask_gemini_for_analysis(
             api_key=api_key,
             http_options={"timeout": 300000},  # 300秒 (ms単位)
         )
-        response = client.models.generate_content(
+        # ストリーミングで受信（read_timeout を回避）
+        _chunks: list[str] = []
+        for _chunk in client.models.generate_content_stream(
             model="gemini-2.5-flash",
             contents=prompt,
             config=_gtypes.GenerateContentConfig(
@@ -227,8 +229,10 @@ def ask_gemini_for_analysis(
                 temperature=0.35,
                 thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
             ),
-        )
-        result = json.loads(response.text)
+        ):
+            if _chunk.text:
+                _chunks.append(_chunk.text)
+        result = json.loads("".join(_chunks))
         result["error"] = None
         result["generated_at"] = datetime.now().isoformat()
         return result
@@ -379,7 +383,9 @@ def ask_gemini_to_implement_indicators(
             api_key=api_key,
             http_options={"timeout": 300000},  # 300秒 (ms単位)
         )
-        response = client.models.generate_content(
+        # ストリーミングで受信（read_timeout を回避）
+        _chunks: list[str] = []
+        for _chunk in client.models.generate_content_stream(
             model="gemini-2.5-flash",
             contents=prompt,
             config=_gtypes.GenerateContentConfig(
@@ -387,8 +393,10 @@ def ask_gemini_to_implement_indicators(
                 temperature=0.25,
                 thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
             ),
-        )
-        result = json.loads(response.text)
+        ):
+            if _chunk.text:
+                _chunks.append(_chunk.text)
+        result = json.loads("".join(_chunks))
         result["error"] = None
         result["generated_at"] = datetime.now().isoformat()
         # 重みの合計を検証・補正

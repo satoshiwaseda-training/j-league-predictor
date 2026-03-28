@@ -809,7 +809,9 @@ def predict_with_gemini(
 
 home_win_prob + draw_prob + away_win_prob = 100 を厳守。"""
 
-        resp = client.models.generate_content(
+        # ストリーミングで受信（read_timeout を回避）
+        _chunks: list[str] = []
+        for _chunk in client.models.generate_content_stream(
             model="gemini-2.5-flash",
             contents=prompt,
             config=gtypes.GenerateContentConfig(
@@ -818,9 +820,10 @@ home_win_prob + draw_prob + away_win_prob = 100 を厳守。"""
                 max_output_tokens=2048,
                 thinking_config=gtypes.ThinkingConfig(thinking_budget=0),
             ),
-        )
-
-        raw = resp.text.strip()
+        ):
+            if _chunk.text:
+                _chunks.append(_chunk.text)
+        raw = "".join(_chunks).strip()
         if "```" in raw:
             raw = raw.split("```")[1].lstrip("json").strip().split("```")[0]
 
