@@ -1,5 +1,5 @@
 """
-predictor.py - Gemini 2.0 Flash API を使ったJリーグ試合予測エンジン
+predictor.py - Gemini 2.5 Flash API を使ったJリーグ試合予測エンジン
 """
 
 from __future__ import annotations
@@ -37,7 +37,10 @@ def _get_gemini_client():
             pass
     if not api_key or api_key == "your_gemini_api_key_here":
         raise ValueError("GEMINI_API_KEY が設定されていません。.env を確認してください。")
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options={"timeout": 30},  # 30秒でタイムアウト（WebSocket切断防止）
+    )
 
 
 # ─────────────────────────────────────────────
@@ -57,7 +60,7 @@ def predict_match(
     away_injuries: list[dict],
 ) -> dict[str, Any]:
     """
-    Gemini 2.0 Flash で試合結果を予測。
+    Gemini 2.5 Flash で試合結果を予測。
 
     Returns
     -------
@@ -85,7 +88,7 @@ def predict_match(
         from google import genai as _genai
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
             config=_genai.types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -101,7 +104,7 @@ def predict_match(
             raw = raw.split("```")[1].split("```")[0].strip()
 
         result = json.loads(raw)
-        result["model"] = "gemini-2.0-flash"
+        result["model"] = "gemini-2.5-flash"
         _normalize_probs(result)
         return result
 

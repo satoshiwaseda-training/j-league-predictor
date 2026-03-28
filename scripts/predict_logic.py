@@ -1,6 +1,6 @@
 """
 scripts/predict_logic.py - Jリーグ予測コアロジック v3
-Gemini 2.0 Flash 設計会議 (2026-03) + 論文ベース最適化
+Gemini 2.5 Flash 設計会議 (2026-03) + 論文ベース最適化
 
 v3 追加パラメータ (Gemini設計):
   capital_power:   0.12  親会社収益・年俸総額スカッド質 (Peeters 2018: R²≈0.65-0.72)
@@ -29,22 +29,24 @@ logger = logging.getLogger(__name__)
 # ─── Gemini v3 設計重み (2026-03-01 第2回設計会議) ─────
 # 重み合計 = 1.00 (Gemini推奨値 + 端数調整)
 MODEL_WEIGHTS: dict[str, float] = {
-    "team_strength":         0.1400,  # 勝点・順位差
-    "attack_rate":           0.0940,  # 得点率/試合 (Dixon-Coles λ)
-    "defense_rate":          0.0750,  # 失点率/試合 (Dixon-Coles μ)
-    "recent_form":           0.1690,  # 直近フォームPPG (最信頼性)
-    "xg_differential":       0.0750,  # xG差 (FBref J1)
-    "home_advantage":        0.0940,  # ホームADV
-    "capital_power":         0.1130,  # 資本力 (R²≈0.65-0.72 vs 勝点)
-    "head_to_head":          0.0380,  # H2H (Cohen's d小)
-    "discipline_risk":       0.0380,  # 規律・カード累積リスク
-    "attrition_rate":        0.0380,  # 損耗率 (スカッド比率)
-    "match_interval":        0.0380,  # 試合間隔疲労 U字型
-    "injury_impact":         0.0190,  # 個別怪我絶対数
-    "weather_fatigue":       0.0090,  # 天気疲労 (効果小)
-    "travel_distance":       0.0000,  # 移動距離 (J地理圧縮 → 実質0)
-    "set_piece_conversion":  0.0300,  # Gemini提案: セットプレー得点率
-    "match_day_motivation":  0.0300,  # Gemini提案: 試合当日モチベーション
+    "team_strength":          0.1300,  # 勝点・順位差
+    "attack_rate":            0.0900,  # 得点率/試合 (Dixon-Coles λ)
+    "defense_rate":           0.0700,  # 失点率/試合 (Dixon-Coles μ)
+    "recent_form":            0.1600,  # 直近フォームPPG (最信頼性)
+    "xg_for":                 0.0350,  # Gemini提案: 期待得点 (攻撃力)
+    "xg_against":             0.0350,  # Gemini提案: 期待失点 (守備力)
+    "home_advantage":         0.0900,  # ホームADV
+    "capital_power":          0.1100,  # 資本力 (R²≈0.65-0.72 vs 勝点)
+    "head_to_head":           0.0400,  # H2H (Cohen's d小)
+    "discipline_risk":        0.0400,  # 規律・カード累積リスク
+    "attrition_rate":         0.0400,  # 損耗率 (スカッド比率)
+    "match_interval":         0.0400,  # 試合間隔疲労 U字型
+    "injury_impact":          0.0200,  # 個別怪我絶対数
+    "weather_fatigue":        0.0100,  # 天気疲労 (効果小)
+    "travel_distance":        0.0000,  # 移動距離 (J地理圧縮 → 実質0)
+    "set_piece_conversion":   0.0300,  # Gemini提案: セットプレー得点率
+    "match_day_motivation":   0.0300,  # Gemini提案: 試合当日モチベーション
+    "tactical_adaptability":  0.0300,  # Gemini提案: 戦術的適応能力
 }
 
 # ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
@@ -351,6 +353,62 @@ def score_xg_differential(
     return round(h_norm, 3), round(a_norm, 3)
 
 
+def score_xg_for(
+    home_xg: dict,
+    away_xg: dict,
+) -> tuple[float, float]:
+    """期待得点(xG For)スコア (0.0〜1.0, 高いほど攻撃力がある)"""
+    def _score(xg_for: float | None) -> float:
+        if xg_for is None:
+            return 0.50
+        if xg_for <= 0.5:  return 0.10
+        if xg_for <= 1.0:  return 0.10 + (xg_for - 0.5) * 0.8
+        if xg_for <= 1.5:  return 0.50 + (xg_for - 1.0) * 0.5
+        if xg_for <= 2.0:  return 0.75 + (xg_for - 1.5) * 0.3
+        return round(min(1.0, 0.90 + (xg_for - 2.0) * 0.1), 3)
+    h = None if not home_xg else home_xg.get("xg_for")
+    a = None if not away_xg else away_xg.get("xg_for")
+    return round(_score(float(h) if h is not None else None), 3), \
+           round(_score(float(a) if a is not None else None), 3)
+
+
+def score_xg_against(
+    home_xg: dict,
+    away_xg: dict,
+) -> tuple[float, float]:
+    """期待失点(xG Against)スコア (0.0〜1.0, 高いほど守備力がある)"""
+    def _score(xg_against: float | None) -> float:
+        if xg_against is None:
+            return 0.50
+        if xg_against >= 2.0:  return 0.10
+        if xg_against >= 1.5:  return 0.10 + (2.0 - xg_against) * 0.8
+        if xg_against >= 1.0:  return 0.50 + (1.5 - xg_against) * 0.5
+        if xg_against >= 0.5:  return 0.75 + (1.0 - xg_against) * 0.3
+        return round(min(1.0, 0.90 + (0.5 - xg_against) * 0.1), 3)
+    h = None if not home_xg else home_xg.get("xg_against")
+    a = None if not away_xg else away_xg.get("xg_against")
+    return round(_score(float(h) if h is not None else None), 3), \
+           round(_score(float(a) if a is not None else None), 3)
+
+
+def score_tactical_adaptability(
+    home_tactics: dict,
+    away_tactics: dict,
+) -> tuple[float, float]:
+    """戦術的適応能力スコア (0.0〜1.0, 高いほど柔軟な対応が可能)"""
+    def _score(td: dict) -> float:
+        if not td:
+            return 0.50
+        score = (
+            td.get("change_frequency", 0.5) * 0.30 +
+            td.get("success_rate",     0.5) * 0.40 +
+            td.get("formation_diversity", 0.5) * 0.20 +
+            td.get("player_diversity", 0.5) * 0.10
+        )
+        return round(max(0.0, min(1.0, score)), 3)
+    return _score(home_tactics), _score(away_tactics)
+
+
 def score_recent_form(form: list[str] | str) -> float:
     """
     直近5試合フォーム → スコア (0.0〜1.0)
@@ -434,6 +492,8 @@ def calculate_parameter_contributions(
     away_set_pieces: dict | None = None,
     home_motivation: dict | None = None,  # Gemini提案: 試合当日モチベーション
     away_motivation: dict | None = None,
+    home_tactics: dict | None = None,    # Gemini提案: 戦術的適応能力
+    away_tactics: dict | None = None,
 ) -> dict[str, Any]:
     """
     各パラメータのホーム有利度スコアと重み付き貢献度を計算。
@@ -468,6 +528,8 @@ def calculate_parameter_contributions(
     h_form              = score_recent_form(home_form)
     a_form              = score_recent_form(away_form)
     h_xg_s, a_xg_s     = score_xg_differential(home_xg or {}, away_xg or {})
+    h_xg_for, a_xg_for      = score_xg_for(home_xg or {}, away_xg or {})
+    h_xg_against, a_xg_against = score_xg_against(home_xg or {}, away_xg or {})
     h_home              = score_home_advantage()
     a_away              = 1.0 - h_home
     h_cap, a_cap        = score_capital_power(home_team, away_team)
@@ -488,6 +550,9 @@ def calculate_parameter_contributions(
     h_motiv, a_motiv    = score_match_day_motivation(
                               home_motivation or {}, away_motivation or {}
                           )
+    h_tact, a_tact      = score_tactical_adaptability(
+                              home_tactics or {}, away_tactics or {}
+                          )
 
     params: dict[str, dict] = {}
     raw_adv = 0.0
@@ -497,7 +562,8 @@ def calculate_parameter_contributions(
         ("attack_rate",     h_atk,      a_atk),
         ("defense_rate",    h_def,      a_def),
         ("recent_form",     h_form,     a_form),
-        ("xg_differential", h_xg_s,    a_xg_s),
+        ("xg_for",          h_xg_for,     a_xg_for),
+        ("xg_against",      h_xg_against, a_xg_against),
         ("home_advantage",  h_home,     a_away),
         ("capital_power",   h_cap,      a_cap),
         ("head_to_head",    h_h2h,      a_h2h),
@@ -509,6 +575,7 @@ def calculate_parameter_contributions(
         ("travel_distance",        h_travel,   a_travel),
         ("set_piece_conversion",   h_setp,     a_setp),
         ("match_day_motivation",   h_motiv,    a_motiv),
+        ("tactical_adaptability",  h_tact,     a_tact),
     ]:
         adv = round(h_score - a_score, 3)
         w = MODEL_WEIGHTS[name]
@@ -563,7 +630,7 @@ def advantage_to_probs(raw_advantage: float) -> tuple[int, int, int]:
     return h_pct, d_pct, a_pct
 
 
-# ─── Gemini 2.0 Flash 統合予測 ──────────────────────────
+# ─── Gemini 2.5 Flash 統合予測 ──────────────────────────
 
 def predict_with_gemini(
     home_team: str,
@@ -585,7 +652,7 @@ def predict_with_gemini(
     away_injuries: list | None = None,
 ) -> dict[str, Any]:
     """
-    パラメータ貢献度をGemini 2.0 Flashに渡し、
+    パラメータ貢献度をGemini 2.5 Flashに渡し、
     最終的な確率と深い分析根拠を取得する。
     """
     api_key = os.getenv("GEMINI_API_KEY", "")
@@ -598,7 +665,10 @@ def predict_with_gemini(
         from google import genai
         from google.genai import types as gtypes
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": 30},  # 30秒でタイムアウト（WebSocket切断防止）
+        )
 
         params_text = "\n".join(
             f"  - {k}: ホーム={v['home_score']:.3f} アウェー={v['away_score']:.3f} "
@@ -740,7 +810,7 @@ def predict_with_gemini(
 home_win_prob + draw_prob + away_win_prob = 100 を厳守。"""
 
         resp = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
             config=gtypes.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -754,7 +824,7 @@ home_win_prob + draw_prob + away_win_prob = 100 を厳守。"""
             raw = raw.split("```")[1].lstrip("json").strip().split("```")[0]
 
         result = json.loads(raw)
-        result["model"] = "gemini-2.0-flash"
+        result["model"] = "gemini-2.5-flash"
         result["distance_km"] = contributions["distance_km"]
         result["contributions"] = contributions["parameters"]
         _normalize(result)

@@ -5,8 +5,8 @@
 streamlit>=1.41.0
 plotly>=5.24.0
 
-# AI (Gemini 2.0 Flash)
-google-genai>=1.0.0
+# AI (Gemini 2.5 Flash)
+google-genai>=1.10.0
 
 # データ取得 / スクレイピング
 requests>=2.31.0

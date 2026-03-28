@@ -1,7 +1,7 @@
 """
 scripts/feedback_loop.py - 予測フィードバックループ
 
-過去の予測と実結果を照合し、Gemini 2.0 Flash による
+過去の予測と実結果を照合し、Gemini 2.5 Flash による
 敗因分析・パラメータ調整提案・新指標提案を生成する。
 """
 from __future__ import annotations
@@ -121,7 +121,7 @@ def ask_gemini_for_analysis(
     weights:     dict[str, float],
 ) -> dict:
     """
-    Gemini 2.0 Flash に不正解予測の敗因分析と改善提案を依頼する。
+    Gemini 2.5 Flash に不正解予測の敗因分析と改善提案を依頼する。
 
     Returns dict with keys:
         defeat_causes: list[str]
@@ -214,9 +214,12 @@ def ask_gemini_for_analysis(
 
     try:
         from google import genai
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": 30},  # 30秒でタイムアウト
+        )
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
             config={
                 "response_mime_type": "application/json",
@@ -369,9 +372,12 @@ def ask_gemini_to_implement_indicators(
 
     try:
         from google import genai
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": 30},  # 30秒でタイムアウト
+        )
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
             config={
                 "response_mime_type": "application/json",

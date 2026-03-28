@@ -213,6 +213,8 @@ def _inject_pwa_meta():
     """
     PWA manifest リンクと apple-mobile-web-app メタを parent document に注入。
     Streamlit は <head> を直接編集できないため iframe 経由で JS を使用。
+    manifest は data: URI として直接埋め込む（Streamlit Cloud では /app/static/ への
+    リクエストが認証ページにリダイレクトされ CORS エラーになるため）。
     """
     import streamlit.components.v1 as _comp
     _comp.html("""
@@ -220,11 +222,12 @@ def _inject_pwa_meta():
     (function() {
         try {
             var doc = window.parent.document;
-            // manifest link
+            // manifest link — data: URI でCORSを回避（静的ファイル参照はCloud authが遮断）
             if (!doc.querySelector('link[rel="manifest"]')) {
+                var manifest = '{"name":"\\u30b5\\u30c8\\u30b7\\u306eJ\\u30ea\\u30fc\\u30b0\\u52dd\\u6557\\u4e88\\u6e2c","short_name":"J\\u30ea\\u30fc\\u30b0\\u4e88\\u6e2c","description":"Gemini AI \\u00d7 J\\u30ea\\u30fc\\u30b0\\u52dd\\u6557\\u4e88\\u6e2c","start_url":"/","display":"standalone","orientation":"portrait-primary","background_color":"#f8fafc","theme_color":"#3b82f6","lang":"ja","categories":["sports","utilities"],"icons":[{"src":"/app/static/icons/icon-192.png","sizes":"192x192","type":"image/png"},{"src":"/app/static/icons/icon-512.png","sizes":"512x512","type":"image/png"}]}';
                 var link = doc.createElement('link');
                 link.rel  = 'manifest';
-                link.href = '/app/static/manifest.json';
+                link.href = 'data:application/json,' + encodeURIComponent(manifest);
                 doc.head.appendChild(link);
             }
             // Apple ホーム画面対応
@@ -246,7 +249,7 @@ def _inject_pwa_meta():
             if (!doc.querySelector('meta[name="apple-mobile-web-app-title"]')) {
                 var at = doc.createElement('meta');
                 at.name = 'apple-mobile-web-app-title';
-                at.content = 'Jリーグ予測';
+                at.content = 'J\u30ea\u30fc\u30b0\u4e88\u6e2c';
                 doc.head.appendChild(at);
             }
         } catch(e) {}
@@ -459,7 +462,7 @@ def sidebar() -> tuple[str, dict | None]:
         <div style='text-align:center;padding:0.5rem 0 1rem;'>
           <div style='font-size:2rem;'>⚽</div>
           <div style='font-weight:900;font-size:1.05rem;color:#f1f5f9;'>サトシのJリーグ予測</div>
-          <div style='font-size:0.7rem;color:#4b5563;'>Gemini 2.0 Flash 搭載</div>
+          <div style='font-size:0.7rem;color:#4b5563;'>Gemini 2.5 Flash 搭載</div>
         </div>""", unsafe_allow_html=True)
 
         division = st.selectbox(
@@ -534,7 +537,7 @@ def sidebar() -> tuple[str, dict | None]:
             _apply_secrets()
             ak = os.getenv("GEMINI_API_KEY", "")
         if ak and ak != "your_gemini_api_key_here":
-            st.success("Gemini 2.0 Flash 接続済み ✓")
+            st.success("Gemini 2.5 Flash 接続済み ✓")
         else:
             st.error("Gemini API キー未設定\n`.env` を確認してください")
         if not _FEEDBACK_OK:
@@ -605,7 +608,7 @@ def render_prediction(match: dict, division: str):
                 home_days=home_days, away_days=away_days,
             )
 
-        with st.spinner("Gemini 2.0 Flash で予測中..."):
+        with st.spinner("Gemini 2.5 Flash で予測中..."):
             prediction = predict_with_gemini(
                 home, away, contributions,
                 home_stats, away_stats,
@@ -1074,7 +1077,7 @@ def render_all_predictions(division: str):
     with col_info:
         api_ok = bool(os.getenv("GEMINI_API_KEY", "").strip())
         if api_ok:
-            st.caption(f"Gemini 2.0 Flash で {len(matches)} 試合を順次予測します（約 {len(matches)*2} 秒）")
+            st.caption(f"Gemini 2.5 Flash で {len(matches)} 試合を順次予測します（約 {len(matches)*2} 秒）")
         else:
             st.caption("Gemini 未接続 — 統計モデルで高速予測します")
 
@@ -1511,7 +1514,7 @@ def render_history(division: str = "j1"):
     # ── Gemini 今週の反省・改善案 ──────────────────────────────
     st.markdown("---")
     st.markdown("#### 🤖 Gemini 反省レポート & 重み調整提案")
-    st.caption("不正解試合を Gemini 2.0 Flash が分析し、モデル改善案を提案します。")
+    st.caption("不正解試合を Gemini 2.5 Flash が分析し、モデル改善案を提案します。")
 
     wrong_preds = [
         p for p in preds
@@ -1529,7 +1532,7 @@ def render_history(division: str = "j1"):
             disabled=gen_disabled,
             help="不正解が1件以上必要です" if gen_disabled else "",
         ):
-            with st.spinner("Gemini 2.0 Flash が分析中..."):
+            with st.spinner("Gemini 2.5 Flash が分析中..."):
                 report = ask_gemini_for_analysis(wrong_preds, preds, MODEL_WEIGHTS)
                 st.session_state["feedback_report"] = report
 
@@ -1604,7 +1607,7 @@ def render_history(division: str = "j1"):
                     use_container_width=True,
                     key="btn_auto_implement",
                 ):
-                    with st.spinner("Gemini 2.0 Flash が実装コードを生成中..."):
+                    with st.spinner("Gemini 2.5 Flash が実装コードを生成中..."):
                         impl = ask_gemini_to_implement_indicators(new_inds, MODEL_WEIGHTS)
                         st.session_state["impl_result"] = impl
 
@@ -1651,7 +1654,7 @@ def render_history(division: str = "j1"):
 
                         # ダウンロードボタン
                         patch_content = (
-                            f"# Auto-generated by Gemini 2.0 Flash — {gen_at}\n"
+                            f"# Auto-generated by Gemini 2.5 Flash — {gen_at}\n"
                             f"# {impl.get('summary','')}\n\n"
                             f"# ━━━ ① スコア関数を predict_logic.py の既存関数の後に追加 ━━━\n\n"
                             f"{all_func_code if funcs else ''}\n\n"
@@ -1856,7 +1859,7 @@ def main():
     <div style="padding:1rem 0 0.6rem;display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
       <div>
         <div class="hero-title">⚽ サトシのJリーグ勝敗予測</div>
-        <div class="hero-sub">Gemini 2.0 Flash × Open-Meteo × jleague.jp データ</div>
+        <div class="hero-sub">Gemini 2.5 Flash × Open-Meteo × jleague.jp データ</div>
       </div>
       <div style="padding-top:0.3rem;">{_acc_html}</div>
     </div>

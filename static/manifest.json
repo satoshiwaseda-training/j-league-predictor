@@ -1,7 +1,7 @@
 {
   "name": "サトシのJリーグ勝敗予測",
   "short_name": "Jリーグ予測",
-  "description": "Gemini 2.0 Flash × AI Jリーグ勝敗予測システム — サトシ専用",
+  "description": "Gemini 2.5 Flash × AI Jリーグ勝敗予測システム — サトシ専用",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait-primary",

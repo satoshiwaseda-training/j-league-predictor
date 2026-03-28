@@ -529,6 +529,13 @@ def get_upcoming_matches(division: str = "j1", weeks_ahead: int = 2) -> list[dic
                     sec_soup = _get(f"{BASE_URL}/match/section/{url_key}/{current_sec}/")
                     if sec_soup:
                         _add(_parse_section_matches(sec_soup, division))
+                # 土日は latest が来週を指している場合があるため1節前も取得
+                if datetime.now().weekday() in (5, 6) and current_sec >= 2:
+                    prev_sec = current_sec - 1
+                    logger.debug("週末: 前節も取得: section %d", prev_sec)
+                    prev_soup = _get(f"{BASE_URL}/match/section/{url_key}/{prev_sec}/")
+                    if prev_soup:
+                        _add(_parse_section_matches(prev_soup, division))
 
         # 今日以降がなければ次節を取得
         upcoming_tmp = [m for m in all_matches if m.get("date", "9999") >= today]
@@ -539,12 +546,21 @@ def get_upcoming_matches(division: str = "j1", weeks_ahead: int = 2) -> list[dic
                 if sec_soup:
                     _add(_parse_section_matches(sec_soup, division))
 
-    upcoming = [m for m in all_matches if m.get("date", "9999") >= today]
+    # 土日は今週の土曜日を起点にする（latest が来週を向いていても今週を表示）
+    _weekday = datetime.now().weekday()
+    if _weekday == 5:  # 土曜
+        cutoff = today
+    elif _weekday == 6:  # 日曜
+        cutoff = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        cutoff = today
+
+    upcoming = [m for m in all_matches if m.get("date", "9999") >= cutoff]
 
     if not upcoming:
         logger.warning("match scrape failed – using generated sample")
         sample = _generate_sample_matches(division, weeks_ahead)
-        upcoming = [m for m in sample if m.get("date", "9999") >= today]
+        upcoming = [m for m in sample if m.get("date", "9999") >= cutoff]
 
     if not upcoming:
         return []
