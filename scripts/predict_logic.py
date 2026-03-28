@@ -665,7 +665,10 @@ def predict_with_gemini(
         from google import genai
         from google.genai import types as gtypes
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": 300000},  # 300秒 (ms単位)
+        )
 
         params_text = "\n".join(
             f"  - {k}: ホーム={v['home_score']:.3f} アウェー={v['away_score']:.3f} "
@@ -813,6 +816,7 @@ home_win_prob + draw_prob + away_win_prob = 100 を厳守。"""
                 response_mime_type="application/json",
                 temperature=0.25,
                 max_output_tokens=2048,
+                thinking_config=gtypes.ThinkingConfig(thinking_budget=0),
             ),
         )
 
