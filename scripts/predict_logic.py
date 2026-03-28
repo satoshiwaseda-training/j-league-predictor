@@ -26,27 +26,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ─── Gemini v3 設計重み (2026-03-01 第2回設計会議) ─────
-# 重み合計 = 1.00 (Gemini推奨値 + 端数調整)
+# ─── Gemini v4 設計重み (2026-03-28 第3回設計会議) ─────
+# 重み合計 = 1.00
+# 追加指標: expected_goals_difference (xGD), player_availability_impact (PAI)
 MODEL_WEIGHTS: dict[str, float] = {
-    "team_strength":          0.1300,  # 勝点・順位差
-    "attack_rate":            0.0900,  # 得点率/試合 (Dixon-Coles λ)
-    "defense_rate":           0.0700,  # 失点率/試合 (Dixon-Coles μ)
-    "recent_form":            0.1600,  # 直近フォームPPG (最信頼性)
-    "xg_for":                 0.0350,  # Gemini提案: 期待得点 (攻撃力)
-    "xg_against":             0.0350,  # Gemini提案: 期待失点 (守備力)
-    "home_advantage":         0.0900,  # ホームADV
-    "capital_power":          0.1100,  # 資本力 (R²≈0.65-0.72 vs 勝点)
-    "head_to_head":           0.0400,  # H2H (Cohen's d小)
-    "discipline_risk":        0.0400,  # 規律・カード累積リスク
-    "attrition_rate":         0.0400,  # 損耗率 (スカッド比率)
-    "match_interval":         0.0400,  # 試合間隔疲労 U字型
-    "injury_impact":          0.0200,  # 個別怪我絶対数
-    "weather_fatigue":        0.0100,  # 天気疲労 (効果小)
-    "travel_distance":        0.0000,  # 移動距離 (J地理圧縮 → 実質0)
-    "set_piece_conversion":   0.0300,  # Gemini提案: セットプレー得点率
-    "match_day_motivation":   0.0300,  # Gemini提案: 試合当日モチベーション
-    "tactical_adaptability":  0.0300,  # Gemini提案: 戦術的適応能力
+    "team_strength":                0.1304,  # 勝点・順位差
+    "attack_rate":                  0.0870,  # 得点率/試合 (Dixon-Coles λ)
+    "defense_rate":                 0.0652,  # 失点率/試合 (Dixon-Coles μ)
+    "recent_form":                  0.1630,  # 直近フォームPPG (最信頼性)
+    "xg_for":                       0.0326,  # 期待得点 (攻撃力)
+    "xg_against":                   0.0326,  # 期待失点 (守備力)
+    "home_advantage":               0.0870,  # ホームADV
+    "capital_power":                0.1087,  # 資本力 (R²≈0.65-0.72 vs 勝点)
+    "head_to_head":                 0.0326,  # H2H (Cohen's d小)
+    "discipline_risk":              0.0326,  # 規律・カード累積リスク
+    "attrition_rate":               0.0326,  # 損耗率 (スカッド比率)
+    "match_interval":               0.0326,  # 試合間隔疲労 U字型
+    "injury_impact":                0.0109,  # 個別怪我絶対数
+    "weather_fatigue":              0.0109,  # 天気疲労 (効果小)
+    "travel_distance":              0.0000,  # 移動距離 (J地理圧縮 → 実質0)
+    "set_piece_conversion":         0.0217,  # セットプレー得点率
+    "match_day_motivation":         0.0217,  # 試合当日モチベーション
+    "tactical_adaptability":        0.0217,  # 戦術的適応能力
+    "expected_goals_difference":    0.0435,  # xGD: チャンス創出・阻止の実力評価
+    "player_availability_impact":   0.0326,  # PAI: 主力選手欠場影響
 }
 
 # ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
@@ -467,6 +470,39 @@ def score_weather(weather: dict) -> float:
     return round(0.55 - fatigue * 0.10, 3)
 
 
+def score_expected_goals_difference(home_xg: dict, away_xg: dict) -> tuple[float, float]:
+    """Expected Goals Difference (xGD) スコア (0.0〜1.0, 高いほど良い)
+    チャンス創出・阻止能力を評価し、拮抗した試合でのドロー予測精度を向上させる。
+    データ: xg_for_per_game, xg_against_per_game を含む辞書
+    """
+    def _score(xg_data: dict) -> float:
+        if not xg_data:
+            return 0.5
+        xg  = float(xg_data.get("xg_for_per_game",     xg_data.get("xg_for",     1.2)))
+        xga = float(xg_data.get("xg_against_per_game",  xg_data.get("xg_against", 1.2)))
+        xgd = xg - xga
+        # -2.0〜+2.0 の範囲を 0.0〜1.0 に線形変換
+        return round(max(0.0, min(1.0, (xgd + 2.0) / 4.0)), 3)
+    return _score(home_xg), _score(away_xg)
+
+
+def score_player_availability_impact(
+    home_player_impact: dict, away_player_impact: dict
+) -> tuple[float, float]:
+    """Player Availability Impact (PAI) スコア (0.0〜1.0, 高いほど影響が少ない=良い)
+    主力選手の欠場がチームに与える影響を数値化する。
+    データ: total_impact_score (0.0=影響なし, 1.0=重大影響) を含む辞書
+    データ未取得時はデフォルト 0.5 (中立) を返す。
+    """
+    def _score(impact_data: dict) -> float:
+        if not impact_data:
+            return 0.5
+        total_impact = float(impact_data.get("total_impact_score", 0.0))
+        # 0.0 (影響なし) → 1.0, 1.0 (重大影響) → 0.5, 2.0 (最大影響) → 0.0
+        return round(max(0.0, min(1.0, 1.0 - (total_impact / 2.0))), 3)
+    return _score(home_player_impact), _score(away_player_impact)
+
+
 # ─── パラメータ貢献度計算 ───────────────────────────────
 
 def calculate_parameter_contributions(
@@ -488,12 +524,14 @@ def calculate_parameter_contributions(
     away_cards: dict | None = None,
     home_days: int = 0,                   # 試合間隔 (日数)
     away_days: int = 0,
-    home_set_pieces: dict | None = None,  # Gemini提案: セットプレー統計
+    home_set_pieces: dict | None = None,       # セットプレー統計
     away_set_pieces: dict | None = None,
-    home_motivation: dict | None = None,  # Gemini提案: 試合当日モチベーション
+    home_motivation: dict | None = None,       # 試合当日モチベーション
     away_motivation: dict | None = None,
-    home_tactics: dict | None = None,    # Gemini提案: 戦術的適応能力
+    home_tactics: dict | None = None,          # 戦術的適応能力
     away_tactics: dict | None = None,
+    home_player_impact: dict | None = None,    # PAI: 主力選手欠場影響
+    away_player_impact: dict | None = None,
 ) -> dict[str, Any]:
     """
     各パラメータのホーム有利度スコアと重み付き貢献度を計算。
@@ -553,6 +591,12 @@ def calculate_parameter_contributions(
     h_tact, a_tact      = score_tactical_adaptability(
                               home_tactics or {}, away_tactics or {}
                           )
+    h_xgd, a_xgd       = score_expected_goals_difference(
+                              home_xg or {}, away_xg or {}
+                          )
+    h_pai, a_pai        = score_player_availability_impact(
+                              home_player_impact or {}, away_player_impact or {}
+                          )
 
     params: dict[str, dict] = {}
     raw_adv = 0.0
@@ -573,9 +617,11 @@ def calculate_parameter_contributions(
         ("injury_impact",   h_inj,      a_inj),
         ("weather_fatigue",        h_weather,  a_weather),
         ("travel_distance",        h_travel,   a_travel),
-        ("set_piece_conversion",   h_setp,     a_setp),
-        ("match_day_motivation",   h_motiv,    a_motiv),
-        ("tactical_adaptability",  h_tact,     a_tact),
+        ("set_piece_conversion",        h_setp,  a_setp),
+        ("match_day_motivation",        h_motiv, a_motiv),
+        ("tactical_adaptability",       h_tact,  a_tact),
+        ("expected_goals_difference",   h_xgd,   a_xgd),
+        ("player_availability_impact",  h_pai,   a_pai),
     ]:
         adv = round(h_score - a_score, 3)
         w = MODEL_WEIGHTS[name]
