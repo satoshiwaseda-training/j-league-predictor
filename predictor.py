@@ -39,7 +39,7 @@ def _get_gemini_client():
         raise ValueError("GEMINI_API_KEY が設定されていません。.env を確認してください。")
     return genai.Client(
         api_key=api_key,
-        http_options={"timeout": 30},  # 30秒でタイムアウト（WebSocket切断防止）
+        http_options={"timeout": 60},  # 60秒でタイムアウト（長文JSON生成に対応）
     )
 
 

@@ -667,7 +667,7 @@ def predict_with_gemini(
 
         client = genai.Client(
             api_key=api_key,
-            http_options={"timeout": 30},  # 30秒でタイムアウト（WebSocket切断防止）
+            http_options={"timeout": 60},  # 60秒でタイムアウト（長文JSON生成に対応）
         )
 
         params_text = "\n".join(

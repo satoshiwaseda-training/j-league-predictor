@@ -216,7 +216,7 @@ def ask_gemini_for_analysis(
         from google import genai
         client = genai.Client(
             api_key=api_key,
-            http_options={"timeout": 30},  # 30秒でタイムアウト
+            http_options={"timeout": 60},  # 60秒でタイムアウト（長文JSON生成に対応）
         )
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -374,7 +374,7 @@ def ask_gemini_to_implement_indicators(
         from google import genai
         client = genai.Client(
             api_key=api_key,
-            http_options={"timeout": 30},  # 30秒でタイムアウト
+            http_options={"timeout": 60},  # 60秒でタイムアウト（長文JSON生成に対応）
         )
         response = client.models.generate_content(
             model="gemini-2.5-flash",
