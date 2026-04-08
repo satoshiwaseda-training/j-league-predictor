@@ -26,34 +26,34 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ─── Gemini v6 設計重み (2026-04-08 第5回設計会議) ─────
+# ─── Gemini v7 設計重み (2026-04-09 第6回設計会議) ─────
 # 重み合計 = 1.00
-# 変更点: ELO導入、バックテスト804試合で検証済み
-# 死にパラメータ6個は残存するが重みを縮小予定
+# 変更: 死にパラメータ6個を0化、ELO=0.13 (val=2025で全指標最良地点)
+# 検証: 804試合 (2024+2025+2026), val=377試合でELO重みスイープ実施
 MODEL_WEIGHTS: dict[str, float] = {
-    "team_strength":                0.1100,  # 勝点・順位差 (ELO導入で縮小)
-    "attack_rate":                  0.0750,  # 得点率/試合 (Dixon-Coles λ)
-    "defense_rate":                 0.0560,  # 失点率/試合 (Dixon-Coles μ)
-    "recent_form":                  0.1270,  # 直近フォームPPG (ELO導入で縮小)
-    "xg_for":                       0.0280,  # 期待得点 (攻撃力)
-    "xg_against":                   0.0280,  # 期待失点 (守備力)
-    "home_advantage":               0.0750,  # ホームADV
-    "capital_power":                0.0930,  # 資本力 (R2=0.65-0.72 vs 勝点)
-    "head_to_head":                 0.0280,  # H2H (Cohen's d小)
-    "discipline_risk":              0.0280,  # 規律・カード累積リスク
-    "attrition_rate":               0.0280,  # 損耗率 (スカッド比率)
-    "match_interval":               0.0280,  # 試合間隔疲労 U字型
-    "injury_impact":                0.0090,  # 個別怪我絶対数
-    "weather_fatigue":              0.0090,  # 天気疲労 (効果小)
-    "travel_distance":              0.0000,  # 移動距離 (J地理圧縮 → 実質0)
-    "set_piece_conversion":         0.0190,  # セットプレー得点率 (inactive)
-    "match_day_motivation":         0.0190,  # 試合当日モチベーション (inactive)
-    "tactical_adaptability":        0.0190,  # 戦術的適応能力 (inactive)
-    "expected_goals_difference":    0.0370,  # xGD: チャンス創出・阻止の実力評価
-    "player_availability_impact":   0.0280,  # PAI: 主力選手欠場影響 (inactive)
-    "match_trend":                  0.0280,  # 試合展開傾向 (inactive)
-    "referee_tendency":             0.0280,  # 審判傾向 (inactive)
-    "elo":                          0.1000,  # ELOレーティング (新規追加)
+    "team_strength":                0.1260,  # 勝点・順位差
+    "attack_rate":                  0.0856,  # 得点率/試合 (Dixon-Coles lambda)
+    "defense_rate":                 0.0640,  # 失点率/試合 (Dixon-Coles mu)
+    "recent_form":                  0.1456,  # 直近フォームPPG
+    "xg_for":                       0.0325,  # 期待得点 (攻撃力)
+    "xg_against":                   0.0325,  # 期待失点 (守備力)
+    "home_advantage":               0.0856,  # ホームADV
+    "capital_power":                0.1063,  # 資本力 (R2=0.65-0.72 vs 勝点)
+    "head_to_head":                 0.0325,  # H2H (Cohen's d小)
+    "discipline_risk":              0.0325,  # 規律・カード累積リスク
+    "attrition_rate":               0.0325,  # 損耗率 (スカッド比率)
+    "match_interval":               0.0325,  # 試合間隔疲労 U字型
+    "injury_impact":                0.0098,  # 個別怪我絶対数
+    "weather_fatigue":              0.0098,  # 天気疲労 (効果小)
+    "travel_distance":              0.0000,  # 移動距離 (実質0)
+    "set_piece_conversion":         0.0000,  # (inactive: データ供給元なし)
+    "match_day_motivation":         0.0000,  # (inactive: データ供給元なし)
+    "tactical_adaptability":        0.0000,  # (inactive: データ供給元なし)
+    "expected_goals_difference":    0.0423,  # xGD
+    "player_availability_impact":   0.0000,  # (inactive: データ供給元なし)
+    "match_trend":                  0.0000,  # (inactive: データ供給元なし)
+    "referee_tendency":             0.0000,  # (inactive: データ供給元なし)
+    "elo":                          0.1300,  # ELOレーティング (val=2025最適値)
 }
 
 # ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
