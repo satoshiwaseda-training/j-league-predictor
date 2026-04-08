@@ -25,6 +25,10 @@ ENV/
 data/predictions.json
 !data/.gitkeep
 
+# ─── バックテスト一時出力 ─────────────────────────
+backtest_results/
+experiment_logs.csv
+
 # ─── デバッグ用一時 .txt ────────────────────────────
 /j1_result.txt
 /j2_2026_data.txt
