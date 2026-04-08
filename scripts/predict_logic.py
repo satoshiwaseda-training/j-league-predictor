@@ -817,6 +817,36 @@ def _legacy_advantage_to_probs(raw_advantage: float) -> tuple[int, int, int]:
 
 # ─── Gemini 2.5 Flash 統合予測 ──────────────────────────
 
+def _build_prior_text(contributions: dict, home_team: str, away_team: str) -> str:
+    """統計モデル事前確率テキストを生成 (Geminiプロンプト用)"""
+    raw_adv = contributions.get("raw_home_advantage", 0.0)
+    closeness = contributions.get("closeness", 0.5)
+    h_pct, d_pct, a_pct = advantage_to_probs(raw_adv, closeness)
+
+    # ELO情報 (あれば)
+    elo_param = contributions.get("parameters", {}).get("elo", {})
+    elo_text = ""
+    if elo_param and elo_param.get("weight", 0) > 0:
+        h_elo_s = elo_param.get("home_score", 0.5)
+        a_elo_s = elo_param.get("away_score", 0.5)
+        elo_text = f"\nELO期待勝率: {home_team} {h_elo_s*100:.0f}% / {away_team} {a_elo_s*100:.0f}%"
+
+    # draw注意シグナル
+    draw_signal = ""
+    if closeness >= 0.5 and d_pct >= 25:
+        draw_signal = f"\n※ 統計モデルは引き分けの可能性を示唆しています (接近度{closeness:.2f})"
+
+    return (
+        f"22パラメータ+ELOの重み付き分析に基づく事前予測:\n"
+        f"  ホーム勝利: {h_pct}%\n"
+        f"  引き分け:   {d_pct}%\n"
+        f"  アウェイ勝利: {a_pct}%\n"
+        f"実力接近度: {closeness:.2f} (1.0=完全均衡, 0.0=一方的)"
+        f"{elo_text}"
+        f"{draw_signal}"
+    )
+
+
 def predict_with_gemini(
     home_team: str,
     away_team: str,
@@ -968,6 +998,9 @@ def predict_with_gemini(
 加重合計ホームアドバンテージスコア: {contributions['raw_home_advantage']:+.4f}
 移動距離: {contributions['distance_km']}km (疲労係数: {contributions['travel_fatigue']:.2f})
 
+## 統計モデル事前確率 (v7 3ロジット方式)
+{_build_prior_text(contributions, home_team, away_team)}
+
 ## 直近フォーム
 {home_team}: {' '.join(home_form)}
 {away_team}: {' '.join(away_form)}
@@ -981,6 +1014,9 @@ def predict_with_gemini(
 ## 指示
 上記データを統合分析し、以下のJSON形式のみで回答してください。
 資本力格差がある場合は「ジャイアントキリング確率」を特に精密に算出すること。
+上記の統計モデル事前確率は22パラメータ+ELOの重み付き分析に基づく参考値です。
+この事前確率を出発点として、直近フォーム・H2H・天気・怪我等の定性情報で補正してください。
+統計モデルが引き分けを示唆している場合は、その可能性を軽視しないでください。
 
 {{
   "home_win_prob": <0-100整数>,
