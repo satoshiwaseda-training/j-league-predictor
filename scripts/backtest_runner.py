@@ -221,6 +221,91 @@ def predict_current_model(
     return {"home": h / t, "draw": d / t, "away": a / t}
 
 
+def _softmax3(lh: float, ld: float, la: float) -> tuple[float, float, float]:
+    """数値安定なsoftmax (3クラス)"""
+    m = max(lh, ld, la)
+    eh = math.exp(lh - m)
+    ed = math.exp(ld - m)
+    ea = math.exp(la - m)
+    s = eh + ed + ea
+    return eh / s, ed / s, ea / s
+
+
+def predict_3logit(
+    home: str, away: str,
+    h_stats: dict, a_stats: dict,
+    h_form: list[str], a_form: list[str],
+    weights: dict[str, float],
+    params: dict[str, Any],
+    elo: EloSystem | None = None,
+) -> dict[str, float]:
+    """
+    3ロジット + softmax 方式: drawに独立したロジットを与える。
+
+    構造:
+      logit_home = scale_ha * raw_advantage + bias_home
+      logit_away = -scale_ha * raw_advantage + bias_away
+      logit_draw = scale_d * closeness + bias_draw
+
+    raw_advantage: 既存の重み付き差分 (home有利で正)
+    closeness: 両チームの実力接近度 (1.0=完全均衡, 0.0=一方的)
+    """
+    from predict_logic import (
+        score_team_strength, score_attack_rate, score_defense_rate,
+        score_recent_form, score_home_advantage, score_capital_power,
+    )
+    p = params
+    form_n = p.get("form_n", 5)
+
+    h_str, a_str = score_team_strength(h_stats, a_stats)
+    h_atk, a_atk = score_attack_rate(h_stats, a_stats)
+    h_def, a_def = score_defense_rate(h_stats, a_stats)
+    h_f = score_recent_form(h_form[-form_n:])
+    a_f = score_recent_form(a_form[-form_n:])
+    h_ha = score_home_advantage()
+    a_ha = 1.0 - h_ha
+    h_cap, a_cap = score_capital_power(home, away)
+
+    scores: dict[str, tuple[float, float]] = {
+        "team_strength": (h_str, a_str),
+        "attack_rate":   (h_atk, a_atk),
+        "defense_rate":  (h_def, a_def),
+        "recent_form":   (h_f, a_f),
+        "home_advantage": (h_ha, a_ha),
+        "capital_power": (h_cap, a_cap),
+    }
+    if elo and weights.get("elo", 0) > 0:
+        scores["elo"] = elo.score_pair(home, away)
+
+    # raw_advantage: 重み付き差分
+    raw_adv = 0.0
+    tw = 0.0
+    for name, (hs, as_) in scores.items():
+        w = weights.get(name, 0.0)
+        raw_adv += (hs - as_) * w
+        tw += w
+    if tw > 0 and abs(tw - 1.0) > 0.01:
+        raw_adv /= tw
+
+    # 接近度: 各特徴量のhome-away差の絶対値の加重平均の逆数
+    # raw_adv が 0 に近いほど closeness が高い
+    closeness = max(0.0, 1.0 - abs(raw_adv) * 3.0)
+
+    # 3ロジット
+    scale_ha = p.get("scale_ha", 2.5)       # 勝敗方向の感度
+    bias_home = p.get("bias_home", 0.25)    # ホームアドバンテージバイアス
+    bias_away = p.get("bias_away", 0.0)
+    scale_draw = p.get("scale_draw", 1.5)   # draw感度
+    bias_draw = p.get("bias_draw", -0.3)    # drawのベースロジット
+
+    logit_h = scale_ha * raw_adv + bias_home
+    logit_a = -scale_ha * raw_adv + bias_away
+    logit_d = scale_draw * closeness + bias_draw
+
+    ph, pd, pa = _softmax3(logit_h, logit_d, logit_a)
+    return {"home": ph, "draw": pd, "away": pa}
+
+
 def predict_always_home(**_kw) -> dict[str, float]:
     """ベースライン: 常にホーム勝ち"""
     return {"home": 0.60, "draw": 0.20, "away": 0.20}
@@ -377,6 +462,9 @@ def run_walk_forward(
         if predictor == "current":
             probs = predict_current_model(home, away, h_stats, a_stats, h_form, a_form,
                                           weights, params, elo)
+        elif predictor == "3logit":
+            probs = predict_3logit(home, away, h_stats, a_stats, h_form, a_form,
+                                   weights, params, elo)
         elif predictor == "always_home":
             probs = predict_always_home()
         elif predictor == "elo_only":
@@ -546,6 +634,94 @@ def optimize(all_results: list[dict], n_trials: int = 200, patience: int = 40) -
     }
 
 
+def optimize_3logit(all_results: list[dict], n_trials: int = 200, patience: int = 40) -> dict:
+    """3ロジットsoftmax予測器のパラメータ最適化"""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    best_ll = float("inf")
+    no_improve = 0
+
+    def objective(trial: optuna.Trial) -> float:
+        nonlocal best_ll, no_improve
+        rw = {
+            "team_strength":  trial.suggest_float("w_ts", 0.01, 0.40),
+            "attack_rate":    trial.suggest_float("w_atk", 0.01, 0.25),
+            "defense_rate":   trial.suggest_float("w_def", 0.01, 0.25),
+            "recent_form":    trial.suggest_float("w_rf", 0.00, 0.30),
+            "home_advantage": trial.suggest_float("w_ha", 0.01, 0.20),
+            "capital_power":  trial.suggest_float("w_cp", 0.00, 0.25),
+            "elo":            trial.suggest_float("w_elo", 0.00, 0.40),
+        }
+        t = sum(rw.values())
+        weights = {k: v / t for k, v in rw.items()}
+
+        params = {
+            "form_n":       trial.suggest_int("fn", 3, 8),
+            "scale_ha":     trial.suggest_float("sha", 0.5, 5.0),
+            "bias_home":    trial.suggest_float("bh", -0.5, 1.0),
+            "bias_away":    trial.suggest_float("ba", -0.5, 0.5),
+            "scale_draw":   trial.suggest_float("sd", 0.3, 4.0),
+            "bias_draw":    trial.suggest_float("bd", -2.0, 0.5),
+            "elo_k":        trial.suggest_float("ek", 10.0, 60.0),
+            "elo_home_bonus": trial.suggest_float("ehb", 20.0, 100.0),
+        }
+
+        res = run_walk_forward(all_results, eval_season=2025,
+                               predictor="3logit", weights=weights, params=params)
+        m = res["metrics"]
+        ll = m.get("log_loss", 999.0)
+
+        # draw予測数ペナルティ: drawを十分出さないモデルは不採用
+        draw_pred = m.get("predicted_distribution", {}).get("draw", 0)
+        if draw_pred == 0:
+            ll += 0.15
+        elif draw_pred < 20:
+            ll += 0.05  # drawが少なすぎる
+
+        # F1考慮: macro F1が低すぎるペナルティ
+        f1m = m.get("f1_macro", 0)
+        if f1m < 0.30:
+            ll += 0.05
+
+        if ll < best_ll:
+            best_ll = ll
+            no_improve = 0
+        else:
+            no_improve += 1
+        return ll
+
+    class StopCB:
+        def __call__(self, study, trial):
+            if no_improve >= patience:
+                logger.info("3logit early stop at trial %d", trial.number)
+                study.stop()
+
+    study = optuna.create_study(direction="minimize",
+                                sampler=optuna.samplers.TPESampler(seed=SEED))
+    study.optimize(objective, n_trials=n_trials, callbacks=[StopCB()])
+
+    bp = study.best_trial.params
+    rw = {
+        "team_strength": bp["w_ts"], "attack_rate": bp["w_atk"],
+        "defense_rate": bp["w_def"], "recent_form": bp["w_rf"],
+        "home_advantage": bp["w_ha"], "capital_power": bp["w_cp"],
+        "elo": bp["w_elo"],
+    }
+    t = sum(rw.values())
+    best_weights = {k: round(v / t, 4) for k, v in rw.items()}
+    best_params = {
+        "form_n": bp["fn"],
+        "scale_ha": bp["sha"], "bias_home": bp["bh"], "bias_away": bp["ba"],
+        "scale_draw": bp["sd"], "bias_draw": bp["bd"],
+        "elo_k": bp["ek"], "elo_home_bonus": bp["ehb"],
+    }
+    return {
+        "best_weights": best_weights, "best_params": best_params,
+        "best_log_loss": study.best_value, "n_trials": len(study.trials),
+    }
+
+
 # ════════════════════════════════════════════════════════
 # 8. 定数
 # ════════════════════════════════════════════════════════
@@ -572,7 +748,7 @@ BASELINE_PARAMS: dict[str, Any] = {
     "elo_home_bonus": 50.0,
 }
 
-ALL_PREDICTORS = ["current", "always_home", "elo_only", "form_only", "uniform", "prior", "draw_aware"]
+ALL_PREDICTORS = ["current", "3logit", "elo_only", "always_home", "form_only", "prior", "draw_aware", "uniform"]
 
 
 # ════════════════════════════════════════════════════════
@@ -600,6 +776,7 @@ def _print_metrics(label: str, m: dict) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Jリーグ予測バックテスト v2")
     parser.add_argument("--optimize", action="store_true")
+    parser.add_argument("--optimize-3logit", action="store_true")
     parser.add_argument("--baselines", action="store_true")
     parser.add_argument("--n-trials", type=int, default=200)
     parser.add_argument("--patience", type=int, default=40)
@@ -737,6 +914,56 @@ def main():
         with open(detail, "w", encoding="utf-8") as f:
             json.dump(opt, f, ensure_ascii=False, indent=2, default=str)
         logger.info("Saved: %s", detail)
+
+    # ─── 3logit Optuna最適化 ───
+    if args.optimize_3logit:
+        print("\n" + "=" * 60)
+        print("  3-LOGIT OPTUNA OPTIMIZATION (train=2024, val=2025)")
+        print("=" * 60)
+        logger.info("Starting 3logit optimization...")
+
+        opt3 = optimize_3logit(all_results, n_trials=args.n_trials, patience=args.patience)
+        print(f"\nTrials: {opt3['n_trials']}")
+        print(f"Best val log_loss: {opt3['best_log_loss']:.4f}")
+        print(f"\nBest weights:")
+        for k, v in opt3["best_weights"].items():
+            print(f"  {k}: {v:.4f}")
+        print(f"\nBest params:")
+        for k, v in opt3["best_params"].items():
+            print(f"  {k}: {v}")
+
+        # 再評価
+        print("\n--- 3logit optimized on val=2025 ---")
+        res3 = run_walk_forward(all_results, eval_season=2025, predictor="3logit",
+                                weights=opt3["best_weights"], params=opt3["best_params"])
+        _print_metrics("3logit_opt_val2025", res3["metrics"])
+
+        if 2026 in set(r.get("season") for r in all_results):
+            print("\n--- 3logit optimized on 2026 holdout ---")
+            res326 = run_walk_forward(all_results, eval_season=2026, predictor="3logit",
+                                      weights=opt3["best_weights"], params=opt3["best_params"])
+            _print_metrics("3logit_opt_2026", res326["metrics"])
+
+        # 比較
+        bv = res_2025["metrics"]
+        ov3 = res3["metrics"]
+        if bv.get("accuracy") and ov3.get("accuracy"):
+            print(f"\n--- Improvement vs current v5 ---")
+            for k in ["accuracy", "f1_macro", "log_loss", "brier_score"]:
+                d = ov3.get(k, 0) - bv.get(k, 0)
+                better = d > 0 if k in ("accuracy", "f1_macro") else d < 0
+                print(f"  {k}: {bv[k]:.4f} -> {ov3[k]:.4f} ({d:+.4f} {'OK' if better else 'WORSE'})")
+            dp = ov3.get("predicted_distribution", {}).get("draw", 0)
+            print(f"  draw predicted: {dp}")
+
+        opt3_id = f"3logit_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        save_log(opt3_id, "3logit_optimized", 2025, res3["metrics"],
+                 weights=opt3["best_weights"], features=list(opt3["best_weights"].keys()),
+                 notes=f"3logit Optuna {opt3['n_trials']} trials")
+        detail3 = RESULTS_DIR / f"{opt3_id}_detail.json"
+        with open(detail3, "w", encoding="utf-8") as f:
+            json.dump(opt3, f, ensure_ascii=False, indent=2, default=str)
+        logger.info("Saved: %s", detail3)
 
 
 if __name__ == "__main__":
