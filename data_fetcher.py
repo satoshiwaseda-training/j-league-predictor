@@ -956,6 +956,192 @@ def get_past_results(division: str = "j1") -> list[dict]:
 
 
 # ─────────────────────────────────────────────
+# 過去シーズンの試合結果 (data.j-league.or.jp)
+# ─────────────────────────────────────────────
+
+# data.j-league.or.jp の短縮名 → フル名マッピング
+# _SHORT_NAME_MAP と重複するものが多いが、全角/半角の差異を吸収するため個別に定義
+_JDATA_SHORT_NAME_MAP: dict[str, str] = {
+    # data.j-league.or.jp で使われる全角短縮名 → システム内フル名
+    "Ｇ大阪": "ガンバ大阪",
+    "Ｃ大阪": "セレッソ大阪",
+    "川崎Ｆ": "川崎フロンターレ",
+    "東京Ｖ": "東京ヴェルディ",
+    "横浜FM": "横浜F・マリノス",
+    "横浜FC": "横浜FC",
+    "FC東京": "FC東京",
+    "町田":   "FC町田ゼルビア",
+    "神戸":   "ヴィッセル神戸",
+    "浦和":   "浦和レッズ",
+    "鹿島":   "鹿島アントラーズ",
+    "広島":   "サンフレッチェ広島",
+    "名古屋": "名古屋グランパス",
+    "柏":     "柏レイソル",
+    "福岡":   "アビスパ福岡",
+    "京都":   "京都サンガF.C.",
+    "湘南":   "湘南ベルマーレ",
+    "新潟":   "アルビレックス新潟",
+    "札幌":   "北海道コンサドーレ札幌",
+    "磐田":   "ジュビロ磐田",
+    "鳥栖":   "サガン鳥栖",
+    "清水":   "清水エスパルス",
+    "岡山":   "ファジアーノ岡山",
+    "長崎":   "V・ファーレン長崎",
+    "千葉":   "ジェフユナイテッド千葉",
+    "仙台":   "ベガルタ仙台",
+    "甲府":   "ヴァンフォーレ甲府",
+    "山形":   "モンテディオ山形",
+    "大分":   "大分トリニータ",
+    "熊本":   "ロアッソ熊本",
+}
+
+
+def _normalize_jdata_team(short: str) -> str:
+    """data.j-league.or.jp の短縮名をフル名に変換"""
+    # まず全角→半角の正規化
+    import unicodedata
+    normalized = unicodedata.normalize("NFKC", short).strip()
+    # JDATA固有マッピング → 既存SHORT_NAME_MAP の順で照合
+    return _JDATA_SHORT_NAME_MAP.get(short, _SHORT_NAME_MAP.get(normalized, _SHORT_NAME_MAP.get(short, short)))
+
+
+def get_historical_results(
+    year: int,
+    division: str = "j1",
+) -> list[dict]:
+    """
+    data.j-league.or.jp から指定年の完了済み全試合結果を取得。
+    2024/2025年の過去シーズンデータをバックテスト用に提供する。
+
+    Parameters
+    ----------
+    year : int  (例: 2024, 2025)
+    division : str  (現在 "j1" のみ対応)
+
+    Returns
+    -------
+    [{"date": "YYYY-MM-DD", "home": str, "away": str,
+      "home_score": int, "away_score": int,
+      "score": "H-A", "winner": "home"|"draw"|"away",
+      "section": str, "season": int, "division": str}, ...]
+    """
+    # competition_frame_ids: 1=J1
+    comp_id = {"j1": 1, "j2": 2, "j3": 3}.get(division, 1)
+    url = (
+        f"https://data.j-league.or.jp/SFMS01/search"
+        f"?competition_years={year}&competition_frame_ids={comp_id}"
+    )
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        html = resp.content.decode("utf-8", errors="ignore")
+    except Exception as exc:
+        logger.warning("historical fetch failed: %s → %s", url, exc)
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    tables = soup.find_all("table")
+    if not tables:
+        logger.warning("No table found for year=%d div=%s", year, division)
+        return []
+
+    results: list[dict] = []
+    for row in tables[0].find_all("tr")[1:]:  # skip header
+        cells = [c.get_text(strip=True) for c in row.find_all("td")]
+        if len(cells) < 8:
+            continue
+
+        # cells: [シーズン, 大会, 節, 試合日, K/O時刻, ホーム, スコア, アウェイ, ...]
+        section_str = cells[2]   # "第１節第１日" etc
+        date_raw    = cells[3]   # "25/02/14(金)" etc
+        home_short  = cells[5]
+        score_raw   = cells[6]   # "2-5" or empty
+        away_short  = cells[7]
+
+        # スコアがない (未完了) はスキップ
+        score_m = re.match(r"(\d+)\s*-\s*(\d+)", score_raw)
+        if not score_m:
+            continue
+
+        h_score = int(score_m.group(1))
+        a_score = int(score_m.group(2))
+        winner = "home" if h_score > a_score else ("away" if a_score > h_score else "draw")
+
+        # 日付パース: "25/02/14(金)" → "2025-02-14"
+        date_m = re.match(r"(\d{2})/(\d{2})/(\d{2})", date_raw)
+        if not date_m:
+            continue
+        yy = int(date_m.group(1))
+        mm = int(date_m.group(2))
+        dd = int(date_m.group(3))
+        full_year = 2000 + yy if yy < 50 else 1900 + yy
+        date_str = f"{full_year}-{mm:02d}-{dd:02d}"
+
+        # 節番号の抽出
+        sec_m = re.search(r"第(\d+)節", section_str)
+        section = int(sec_m.group(1)) if sec_m else 0
+
+        home = _normalize_jdata_team(home_short)
+        away = _normalize_jdata_team(away_short)
+
+        results.append({
+            "date":       date_str,
+            "home":       home,
+            "away":       away,
+            "home_score": h_score,
+            "away_score": a_score,
+            "score":      f"{h_score}-{a_score}",
+            "winner":     winner,
+            "section":    section,
+            "season":     year,
+            "division":   division.upper(),
+        })
+
+    return sorted(results, key=lambda x: (x["date"], x.get("section", 0)))
+
+
+def get_multi_season_results(
+    years: list[int] | None = None,
+    division: str = "j1",
+) -> list[dict]:
+    """
+    複数シーズンの試合結果を統合して返す。
+    years未指定時: [2024, 2025] + 2026(現シーズン)
+
+    Parameters
+    ----------
+    years : [2024, 2025] など
+    division : "j1"
+
+    Returns
+    -------
+    日付順ソート済みの全試合リスト
+    """
+    import time as _time
+    years = years or [2024, 2025]
+    all_results: list[dict] = []
+
+    for y in years:
+        logger.info("Fetching %d %s results...", y, division)
+        results = get_historical_results(y, division)
+        logger.info("  → %d matches", len(results))
+        all_results.extend(results)
+        _time.sleep(1)  # polite delay
+
+    # 現シーズン (2026) も追加する場合
+    current_year = datetime.now().year
+    if current_year not in years:
+        logger.info("Fetching %d %s (current season)...", current_year, division)
+        current = get_past_results(division)
+        for r in current:
+            r["season"] = current_year
+        logger.info("  → %d matches", len(current))
+        all_results.extend(current)
+
+    return sorted(all_results, key=lambda x: x["date"])
+
+
+# ─────────────────────────────────────────────
 # FBref xG・シュートデータ (J1のみ)
 # ─────────────────────────────────────────────
 
