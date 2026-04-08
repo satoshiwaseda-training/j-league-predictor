@@ -295,6 +295,26 @@ def cached_past_results(division: str) -> list[dict]:
     """今季完了試合一覧 (試合間隔計算に使用)"""
     return get_past_results(division)
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_elo_ratings(division: str) -> dict[str, float]:
+    """ELOレーティングをdictとして返す (cache_data互換)"""
+    from scripts.predict_logic import EloSystem
+    past = cached_past_results(division)
+    elo = EloSystem(k=32.0, initial=1500.0, home_bonus=50.0)
+    for r in past:
+        if r.get("winner"):
+            elo.update(r["home"], r["away"], r["winner"])
+    return elo.ratings.copy()
+
+def get_elo_scores(division: str, home: str, away: str) -> tuple[float, float]:
+    """ELO期待勝率を取得 (キャッシュ経由)"""
+    ratings = cached_elo_ratings(division)
+    initial, home_bonus = 1500.0, 50.0
+    rh = ratings.get(home, initial) + home_bonus
+    ra = ratings.get(away, initial)
+    eh = 1.0 / (1.0 + 10.0 ** ((ra - rh) / 400.0))
+    return eh, 1.0 - eh
+
 
 # ─── UI ヘルパー ─────────────────────────────────────────
 
@@ -598,6 +618,7 @@ def render_prediction(match: dict, division: str):
             past        = cached_past_results(division)
             home_days   = calc_match_interval(home, str(match_date), past)
             away_days   = calc_match_interval(away, str(match_date), past)
+            elo_h, elo_a = get_elo_scores(division, home, away)
 
             contributions = calculate_parameter_contributions(
                 home, away,
@@ -606,6 +627,7 @@ def render_prediction(match: dict, division: str):
                 home_xg=home_xg, away_xg=away_xg,
                 home_cards=home_cards, away_cards=away_cards,
                 home_days=home_days, away_days=away_days,
+                elo_home_score=elo_h, elo_away_score=elo_a,
             )
 
         with st.spinner("Gemini 2.5 Flash で予測中..."):
@@ -1120,6 +1142,7 @@ def render_all_predictions(division: str):
                 away_cards = cards_data.get(away, {})
                 home_days  = calc_match_interval(home, match["date"], past)
                 away_days  = calc_match_interval(away, match["date"], past)
+                elo_h, elo_a = get_elo_scores(division, home, away)
 
                 contributions = calculate_parameter_contributions(
                     home, away,
@@ -1128,6 +1151,7 @@ def render_all_predictions(division: str):
                     home_xg=home_xg, away_xg=away_xg,
                     home_cards=home_cards, away_cards=away_cards,
                     home_days=home_days, away_days=away_days,
+                    elo_home_score=elo_h, elo_away_score=elo_a,
                 )
                 prediction = predict_with_gemini(
                     home, away, contributions,
@@ -1263,6 +1287,7 @@ def run_season_backtest(division: str) -> tuple[int, int]:
             away_cards  = cards_data.get(m["away"], {})
             home_days   = calc_match_interval(m["home"], m["date"], past)
             away_days   = calc_match_interval(m["away"], m["date"], past)
+            elo_h, elo_a = get_elo_scores(division, m["home"], m["away"])
 
             # ★ 実際の天気データ（アーカイブ）を使用
             weather = get_historical_weather(home_venue["lat"], home_venue["lon"], m["date"])
@@ -1274,6 +1299,7 @@ def run_season_backtest(division: str) -> tuple[int, int]:
                 home_xg=home_xg, away_xg=away_xg,
                 home_cards=home_cards, away_cards=away_cards,
                 home_days=home_days, away_days=away_days,
+                elo_home_score=elo_h, elo_away_score=elo_a,
             )
 
             # 統計モデルで確率算出（高速・再現性重視）

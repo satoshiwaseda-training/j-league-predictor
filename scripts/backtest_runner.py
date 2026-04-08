@@ -318,10 +318,14 @@ def predict_integrated(
     本番統合版: predict_logic.py の advantage_to_probs() (3ロジット版) を
     calculate_parameter_contributions() 経由で呼び出す。
     """
-    from predict_logic import (
-        calculate_parameter_contributions, advantage_to_probs,
-        score_capital_power,
-    )
+    try:
+        from predict_logic import (
+            calculate_parameter_contributions, advantage_to_probs,
+        )
+    except ModuleNotFoundError:
+        from scripts.predict_logic import (
+            calculate_parameter_contributions, advantage_to_probs,
+        )
     from venues import get_venue_info
 
     h_venue = get_venue_info(home)
