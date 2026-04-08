@@ -748,13 +748,13 @@ def _softmax3(lh: float, ld: float, la: float) -> tuple[float, float, float]:
     return eh / s, ed / s, ea / s
 
 
-# 3ロジット変換のパラメータ (バックテスト最適化済み)
+# 3ロジット変換のパラメータ (v7再探索済み, val=2025 F1=0.435)
 _3LOGIT_PARAMS = {
     "scale_ha":   1.44,    # 勝敗方向の感度
     "bias_home":  0.14,    # ホームバイアス
     "bias_away":  0.07,    # アウェイバイアス
-    "scale_draw": 1.01,    # draw感度
-    "bias_draw":  -0.82,   # drawベースロジット
+    "scale_draw": 0.80,    # draw感度 (v6:1.01 -> 安定化)
+    "bias_draw":  -0.60,   # drawベースロジット (v6:-0.82 -> draw増加)
 }
 
 
