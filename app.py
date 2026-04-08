@@ -1277,7 +1277,10 @@ def run_season_backtest(division: str) -> tuple[int, int]:
             )
 
             # 統計モデルで確率算出（高速・再現性重視）
-            h_pct, d_pct, a_pct = advantage_to_probs(contributions["raw_home_advantage"])
+            h_pct, d_pct, a_pct = advantage_to_probs(
+                contributions["raw_home_advantage"],
+                contributions.get("closeness", 0.5),
+            )
 
             if h_pct >= a_pct and h_pct >= d_pct:
                 pred_winner = "home"

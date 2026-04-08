@@ -26,30 +26,32 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ─── Gemini v4 設計重み (2026-03-28 第3回設計会議) ─────
+# ─── Gemini v5 設計重み (2026-04-04 第4回設計会議) ─────
 # 重み合計 = 1.00
-# 追加指標: expected_goals_difference (xGD), player_availability_impact (PAI)
+# 追加指標: match_trend (試合展開傾向), referee_tendency (審判傾向)
 MODEL_WEIGHTS: dict[str, float] = {
-    "team_strength":                0.1304,  # 勝点・順位差
-    "attack_rate":                  0.0870,  # 得点率/試合 (Dixon-Coles λ)
-    "defense_rate":                 0.0652,  # 失点率/試合 (Dixon-Coles μ)
-    "recent_form":                  0.1630,  # 直近フォームPPG (最信頼性)
-    "xg_for":                       0.0326,  # 期待得点 (攻撃力)
-    "xg_against":                   0.0326,  # 期待失点 (守備力)
-    "home_advantage":               0.0870,  # ホームADV
-    "capital_power":                0.1087,  # 資本力 (R²≈0.65-0.72 vs 勝点)
-    "head_to_head":                 0.0326,  # H2H (Cohen's d小)
-    "discipline_risk":              0.0326,  # 規律・カード累積リスク
-    "attrition_rate":               0.0326,  # 損耗率 (スカッド比率)
-    "match_interval":               0.0326,  # 試合間隔疲労 U字型
-    "injury_impact":                0.0109,  # 個別怪我絶対数
-    "weather_fatigue":              0.0109,  # 天気疲労 (効果小)
+    "team_strength":                0.1224,  # 勝点・順位差
+    "attack_rate":                  0.0816,  # 得点率/試合 (Dixon-Coles λ)
+    "defense_rate":                 0.0612,  # 失点率/試合 (Dixon-Coles μ)
+    "recent_form":                  0.1531,  # 直近フォームPPG (最信頼性)
+    "xg_for":                       0.0306,  # 期待得点 (攻撃力)
+    "xg_against":                   0.0306,  # 期待失点 (守備力)
+    "home_advantage":               0.0816,  # ホームADV
+    "capital_power":                0.1020,  # 資本力 (R²≈0.65-0.72 vs 勝点)
+    "head_to_head":                 0.0306,  # H2H (Cohen's d小)
+    "discipline_risk":              0.0306,  # 規律・カード累積リスク
+    "attrition_rate":               0.0306,  # 損耗率 (スカッド比率)
+    "match_interval":               0.0306,  # 試合間隔疲労 U字型
+    "injury_impact":                0.0102,  # 個別怪我絶対数
+    "weather_fatigue":              0.0102,  # 天気疲労 (効果小)
     "travel_distance":              0.0000,  # 移動距離 (J地理圧縮 → 実質0)
-    "set_piece_conversion":         0.0217,  # セットプレー得点率
-    "match_day_motivation":         0.0217,  # 試合当日モチベーション
-    "tactical_adaptability":        0.0217,  # 戦術的適応能力
-    "expected_goals_difference":    0.0435,  # xGD: チャンス創出・阻止の実力評価
-    "player_availability_impact":   0.0326,  # PAI: 主力選手欠場影響
+    "set_piece_conversion":         0.0204,  # セットプレー得点率
+    "match_day_motivation":         0.0204,  # 試合当日モチベーション
+    "tactical_adaptability":        0.0204,  # 戦術的適応能力
+    "expected_goals_difference":    0.0408,  # xGD: チャンス創出・阻止の実力評価
+    "player_availability_impact":   0.0306,  # PAI: 主力選手欠場影響
+    "match_trend":                  0.0306,  # 試合展開傾向 (リード守備・逆転率)
+    "referee_tendency":             0.0306,  # 審判傾向 (カード・PK・AT)
 }
 
 # ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
@@ -503,6 +505,74 @@ def score_player_availability_impact(
     return _score(home_player_impact), _score(away_player_impact)
 
 
+def score_match_trend(home_trends: dict, away_trends: dict) -> tuple[float, float]:
+    """試合展開の傾向スコア (0.0〜1.0, 高いほど良い傾向)
+    リードを守る力・劣勢からの追いつき力・逆転率を評価。
+    データキー:
+      lead_win_rate    : リードした試合での勝率 (float)
+      comeback_rate    : リードを許した試合での追いつき率 (float)
+      reverse_win_rate : 逆転勝ち率 (float)
+      reverse_lose_rate: 逆転負け率 (float)
+    データ未取得時は中立値 0.5 を返す。
+    """
+    def _score(trends: dict) -> float:
+        if not trends:
+            return 0.50
+        lead_win_rate    = float(trends.get("lead_win_rate",    0.70))
+        comeback_rate    = float(trends.get("comeback_rate",    0.25))
+        reverse_win_rate = float(trends.get("reverse_win_rate", 0.10))
+        reverse_lose_rate = float(trends.get("reverse_lose_rate", 0.15))
+        score = (
+            lead_win_rate    * 0.4
+            + comeback_rate    * 0.3
+            + reverse_win_rate * 0.2
+            - reverse_lose_rate * 0.1
+        )
+        # 基準値 ≈ 0.36 (デフォルト); 0.2 〜 0.8 → 0.0 〜 1.0 に正規化
+        return round(max(0.0, min(1.0, (score - 0.2) / 0.6)), 3)
+    return _score(home_trends), _score(away_trends)
+
+
+def score_referee_tendency(referee_stats: dict) -> tuple[float, float]:
+    """審判の傾向スコア
+    ホーム/アウェイ別 (0.0〜1.0, 高いほど当該チームに有利な傾向)。
+    データキー:
+      avg_yellow_cards_per_game: 平均イエローカード数/試合 (float)
+      avg_red_cards_per_game   : 平均レッドカード数/試合 (float)
+      home_pk_rate             : ホームにPKを与えた割合 (0.0-1.0)
+      away_pk_rate             : アウェイにPKを与えた割合 (0.0-1.0)
+      avg_additional_time      : 平均アディショナルタイム (float, 分)
+    データ未取得時は中立値 (0.5, 0.5) を返す。
+    """
+    if not referee_stats:
+        return 0.50, 0.50
+    avg_yellow    = float(referee_stats.get("avg_yellow_cards_per_game", 3.5))
+    avg_red       = float(referee_stats.get("avg_red_cards_per_game",    0.15))
+    home_pk_rate  = float(referee_stats.get("home_pk_rate",  0.5))
+    away_pk_rate  = float(referee_stats.get("away_pk_rate",  0.5))
+    avg_add_time  = float(referee_stats.get("avg_additional_time", 8.0))
+
+    # カードペナルティ: 多いほど試合が荒れる → ベーススコアを下げる
+    card_penalty = (avg_yellow * 0.05) + (avg_red * 0.5)
+    card_score   = max(0.0, 0.7 - card_penalty)
+
+    # アディショナルタイム: 平均(8分)から乖離するほど不確実性が増す
+    add_time_impact = 0.0
+    if avg_add_time > 10.0:
+        add_time_impact = -0.05
+    elif avg_add_time < 6.0:
+        add_time_impact = -0.03
+
+    base_score = card_score * 0.6 + 0.5 * 0.4 + add_time_impact
+    normalized  = max(0.0, min(1.0, (base_score - 0.3) / 0.6))
+
+    # PKバイアス: ホームPK率が高いほどホーム有利
+    pk_bias = (home_pk_rate - away_pk_rate) * 0.2
+    home_score = round(max(0.0, min(1.0, normalized + pk_bias)), 3)
+    away_score = round(max(0.0, min(1.0, normalized - pk_bias)), 3)
+    return home_score, away_score
+
+
 # ─── パラメータ貢献度計算 ───────────────────────────────
 
 def calculate_parameter_contributions(
@@ -532,6 +602,9 @@ def calculate_parameter_contributions(
     away_tactics: dict | None = None,
     home_player_impact: dict | None = None,    # PAI: 主力選手欠場影響
     away_player_impact: dict | None = None,
+    home_match_trends: dict | None = None,     # 試合展開傾向統計
+    away_match_trends: dict | None = None,
+    referee_stats: dict | None = None,         # 審判傾向統計
 ) -> dict[str, Any]:
     """
     各パラメータのホーム有利度スコアと重み付き貢献度を計算。
@@ -597,6 +670,10 @@ def calculate_parameter_contributions(
     h_pai, a_pai        = score_player_availability_impact(
                               home_player_impact or {}, away_player_impact or {}
                           )
+    h_trend, a_trend    = score_match_trend(
+                              home_match_trends or {}, away_match_trends or {}
+                          )
+    h_ref, a_ref        = score_referee_tendency(referee_stats or {})
 
     params: dict[str, dict] = {}
     raw_adv = 0.0
@@ -622,6 +699,8 @@ def calculate_parameter_contributions(
         ("tactical_adaptability",       h_tact,  a_tact),
         ("expected_goals_difference",   h_xgd,   a_xgd),
         ("player_availability_impact",  h_pai,   a_pai),
+        ("match_trend",                 h_trend, a_trend),
+        ("referee_tendency",            h_ref,   a_ref),
     ]:
         adv = round(h_score - a_score, 3)
         w = MODEL_WEIGHTS[name]
@@ -635,9 +714,13 @@ def calculate_parameter_contributions(
             "contribution": contrib,
         }
 
+    # 接近度: raw_adv が 0 に近いほど高い (drawの信号として使用)
+    closeness = round(max(0.0, 1.0 - abs(raw_adv) * 3.0), 4)
+
     return {
         "parameters": params,
         "raw_home_advantage": round(raw_adv, 4),
+        "closeness": closeness,
         "distance_km":  dist_km,
         "travel_fatigue": travel_fat,
         "home_days":    home_days,
@@ -649,30 +732,80 @@ def calculate_parameter_contributions(
 
 # ─── 確率変換 ────────────────────────────────────────────
 
-def advantage_to_probs(raw_advantage: float) -> tuple[int, int, int]:
+def _softmax3(lh: float, ld: float, la: float) -> tuple[float, float, float]:
+    """数値安定な3クラスsoftmax"""
+    m = max(lh, ld, la)
+    eh = math.exp(lh - m)
+    ed = math.exp(ld - m)
+    ea = math.exp(la - m)
+    s = eh + ed + ea
+    return eh / s, ed / s, ea / s
+
+
+# 3ロジット変換のパラメータ (バックテスト最適化済み)
+_3LOGIT_PARAMS = {
+    "scale_ha":   1.44,    # 勝敗方向の感度
+    "bias_home":  0.14,    # ホームバイアス
+    "bias_away":  0.07,    # アウェイバイアス
+    "scale_draw": 1.01,    # draw感度
+    "bias_draw":  -0.82,   # drawベースロジット
+}
+
+
+def advantage_to_probs(
+    raw_advantage: float,
+    closeness: float = 0.5,
+    mode: str = "3logit",
+) -> tuple[int, int, int]:
     """
-    raw_advantage (-1〜+1) → (home_win%, draw%, away_win%)
-    シグモイド変換を使用
-    raw_advantage = 0 のとき: home:40%, draw:25%, away:35% (ホームアドバンテージ込み)
+    raw_advantage (-1〜+1) + closeness (0〜1) → (home_win%, draw%, away_win%)
+
+    Parameters
+    ----------
+    raw_advantage : 重み付き特徴量のホーム優勢度 (正=ホーム有利)
+    closeness : 実力接近度 (1.0=完全均衡, 0.0=一方的差)
+                calculate_parameter_contributions() の戻り値に含まれる
+    mode : "3logit" (新方式) or "legacy" (旧シグモイド方式)
+
+    3ロジット方式:
+      logit_home = scale_ha * raw_adv + bias_home
+      logit_away = -scale_ha * raw_adv + bias_away
+      logit_draw = scale_draw * closeness + bias_draw
+      → softmax([logit_home, logit_draw, logit_away])
+
+    drawに独立したロジットを持たせることで、
+    実力接近時にdrawがargmaxで選ばれることが可能。
     """
-    import math
-    # ホームベース確率
+    if mode == "legacy":
+        return _legacy_advantage_to_probs(raw_advantage)
+
+    p = _3LOGIT_PARAMS
+    logit_h = p["scale_ha"] * raw_advantage + p["bias_home"]
+    logit_a = -p["scale_ha"] * raw_advantage + p["bias_away"]
+    logit_d = p["scale_draw"] * closeness + p["bias_draw"]
+
+    h, d, a = _softmax3(logit_h, logit_d, logit_a)
+
+    h_pct = round(h * 100)
+    a_pct = round(a * 100)
+    d_pct = 100 - h_pct - a_pct
+
+    return h_pct, d_pct, a_pct
+
+
+def _legacy_advantage_to_probs(raw_advantage: float) -> tuple[int, int, int]:
+    """旧方式 (シグモイド + draw残差)。rollback用に保持。"""
     base_home = 0.40
     base_draw = 0.25
     base_away = 0.35
-
-    # raw_advantage に基づいてシグモイドシフト
-    shift = math.tanh(raw_advantage * 3) * 0.30  # -0.30〜+0.30
-
+    shift = math.tanh(raw_advantage * 3) * 0.30
     h = max(0.05, min(0.90, base_home + shift))
     a = max(0.05, min(0.90, base_away - shift))
     d = max(0.05, min(0.35, 1.0 - h - a))
-    # 正規化
     total = h + d + a
     h_pct = round(h / total * 100)
     a_pct = round(a / total * 100)
     d_pct = 100 - h_pct - a_pct
-
     return h_pct, d_pct, a_pct
 
 
@@ -704,7 +837,10 @@ def predict_with_gemini(
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key or api_key == "your_gemini_api_key_here":
         # Gemini未設定時は統計モデルのみで予測
-        h_pct, d_pct, a_pct = advantage_to_probs(contributions["raw_home_advantage"])
+        h_pct, d_pct, a_pct = advantage_to_probs(
+            contributions["raw_home_advantage"],
+            contributions.get("closeness", 0.5),
+        )
         return _statistical_result(home_team, away_team, h_pct, d_pct, a_pct, contributions)
 
     try:
@@ -882,7 +1018,10 @@ home_win_prob + draw_prob + away_win_prob = 100 を厳守。"""
 
     except Exception as exc:
         logger.error("Gemini prediction error: %s", exc)
-        h_pct, d_pct, a_pct = advantage_to_probs(contributions["raw_home_advantage"])
+        h_pct, d_pct, a_pct = advantage_to_probs(
+            contributions["raw_home_advantage"],
+            contributions.get("closeness", 0.5),
+        )
         return _statistical_result(home_team, away_team, h_pct, d_pct, a_pct, contributions)
 
 
@@ -931,3 +1070,53 @@ def _statistical_result(
         "distance_km": contributions["distance_km"],
         "contributions": contributions["parameters"],
     }
+
+
+# ─── ELO レーティングシステム ──────────────────────────
+
+class EloSystem:
+    """
+    試合結果から動的に更新するELOレーティング。
+    バックテストと本番で同一実装を使用する。
+
+    Usage:
+        elo = EloSystem(k=32.0, home_bonus=50.0)
+        for match in past_results:
+            elo.update(match["home"], match["away"], match["winner"])
+        h_exp, a_exp = elo.score_pair("チームA", "チームB")
+    """
+
+    def __init__(
+        self,
+        k: float = 32.0,
+        initial: float = 1500.0,
+        home_bonus: float = 50.0,
+    ):
+        self.k = k
+        self.initial = initial
+        self.home_bonus = home_bonus
+        self.ratings: dict[str, float] = {}
+
+    def get(self, team: str) -> float:
+        """チームのELOレーティングを取得 (未登録=initial)"""
+        return self.ratings.get(team, self.initial)
+
+    def expected(self, ra: float, rb: float) -> float:
+        """ELO期待勝率"""
+        return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+
+    def update(self, home: str, away: str, winner: str) -> None:
+        """試合結果でELOを更新"""
+        rh = self.get(home) + self.home_bonus
+        ra = self.get(away)
+        eh = self.expected(rh, ra)
+        sh = 1.0 if winner == "home" else (0.5 if winner == "draw" else 0.0)
+        self.ratings[home] = self.get(home) + self.k * (sh - eh)
+        self.ratings[away] = self.get(away) + self.k * ((1.0 - sh) - (1.0 - eh))
+
+    def score_pair(self, home: str, away: str) -> tuple[float, float]:
+        """ホーム/アウェイのELO期待勝率 (0-1) を返す"""
+        rh = self.get(home) + self.home_bonus
+        ra = self.get(away)
+        eh = self.expected(rh, ra)
+        return eh, 1.0 - eh

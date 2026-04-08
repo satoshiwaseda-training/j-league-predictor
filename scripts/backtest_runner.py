@@ -306,6 +306,41 @@ def predict_3logit(
     return {"home": ph, "draw": pd, "away": pa}
 
 
+def predict_integrated(
+    home: str, away: str,
+    h_stats: dict, a_stats: dict,
+    h_form: list[str], a_form: list[str],
+    weights: dict[str, float],
+    params: dict[str, Any],
+    elo: EloSystem | None = None,
+) -> dict[str, float]:
+    """
+    本番統合版: predict_logic.py の advantage_to_probs() (3ロジット版) を
+    calculate_parameter_contributions() 経由で呼び出す。
+    """
+    from predict_logic import (
+        calculate_parameter_contributions, advantage_to_probs,
+        score_capital_power,
+    )
+    from venues import get_venue_info
+
+    h_venue = get_venue_info(home)
+    a_venue = get_venue_info(away)
+
+    contributions = calculate_parameter_contributions(
+        home, away, h_stats, a_stats, h_form, a_form,
+        {}, {},  # h2h, weather (minimal)
+        [], [],  # injuries
+        h_venue, a_venue,
+    )
+
+    h_pct, d_pct, a_pct = advantage_to_probs(
+        contributions["raw_home_advantage"],
+        contributions.get("closeness", 0.5),
+    )
+    return {"home": h_pct / 100, "draw": d_pct / 100, "away": a_pct / 100}
+
+
 def predict_always_home(**_kw) -> dict[str, float]:
     """ベースライン: 常にホーム勝ち"""
     return {"home": 0.60, "draw": 0.20, "away": 0.20}
@@ -465,6 +500,9 @@ def run_walk_forward(
         elif predictor == "3logit":
             probs = predict_3logit(home, away, h_stats, a_stats, h_form, a_form,
                                    weights, params, elo)
+        elif predictor == "integrated":
+            probs = predict_integrated(home, away, h_stats, a_stats, h_form, a_form,
+                                       weights, params, elo)
         elif predictor == "always_home":
             probs = predict_always_home()
         elif predictor == "elo_only":
@@ -748,7 +786,7 @@ BASELINE_PARAMS: dict[str, Any] = {
     "elo_home_bonus": 50.0,
 }
 
-ALL_PREDICTORS = ["current", "3logit", "elo_only", "always_home", "form_only", "prior", "draw_aware", "uniform"]
+ALL_PREDICTORS = ["current", "integrated", "3logit", "elo_only", "always_home", "form_only", "prior"]
 
 
 # ════════════════════════════════════════════════════════
