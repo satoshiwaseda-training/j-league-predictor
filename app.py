@@ -1554,59 +1554,45 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         "caution": "border-left:3px solid #eab308;",
     }.get(spotlight, "")
 
-    st.markdown(f"""
-    <div class="card" style="margin-bottom:0.8rem;{spot_border}">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
-        <span style="font-size:0.7rem;color:#4b5563;">
-          {spot_icon} {match['date']} {match.get('time','?')} | {match.get('venue','?')}
-        </span>
-        <span>
-          <span style="font-size:0.68rem;padding:2px 8px;border-radius:999px;
-                       border:1px solid;{cl_style[0]}">{cl_style[1]}</span>
-          {draw_badge}
-          {model_badge}
-          <span style="font-size:0.62rem;padding:1px 5px;margin-left:3px;
-                       background:{dq_color}18;color:{dq_color};border-radius:4px;
-                       border:1px solid {dq_color}55;font-weight:700;cursor:help;"
-                 title="{dq_tooltip}">{dq_rank}</span>
-        </span>
-      </div>
-
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.6rem;">
-        <div style="text-align:left;flex:1;">
-          <div style="font-size:1rem;{home_w}">🏠 {home}</div>
-          <div style="font-size:0.65rem;color:#4b5563;">{_rank(home)} {hf_html}</div>
-        </div>
-        <div style="text-align:center;padding:0 0.8rem;">
-          <div style="font-size:1.1rem;font-weight:900;color:#0f172a;">{winner_icon} {score}</div>
-        </div>
-        <div style="text-align:right;flex:1;">
-          <div style="font-size:1rem;{away_w}">{away} ✈</div>
-          <div style="font-size:0.65rem;color:#4b5563;">{_rank(away)} {af_html}</div>
-        </div>
-      </div>
-
-      <div style="border-radius:8px;overflow:hidden;display:flex;height:26px;margin-bottom:4px;">
-        <div style="width:{h_pct}%;background:#3b82f6;display:flex;align-items:center;
-                    justify-content:center;font-size:0.8rem;font-weight:700;color:white;">
-          {h_pct}%
-        </div>
-        <div style="width:{d_pct}%;background:#f59e0b;display:flex;align-items:center;
-                    justify-content:center;font-size:0.8rem;font-weight:700;color:white;">
-          {d_pct}%
-        </div>
-        <div style="width:{a_pct}%;background:#ef4444;display:flex;align-items:center;
-                    justify-content:center;font-size:0.8rem;font-weight:700;color:white;">
-          {a_pct}%
-        </div>
-      </div>
-      <div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">
-        <span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span>
-      </div>
-      {_build_recommendation(cl, dq_rank, cls.get("draw_alert", False), h_pct, d_pct, a_pct)}
-      {details_html}
-    </div>
-    """, unsafe_allow_html=True)
+    # カードHTML: ヘッダー+確率バー (固定長、reasoningを含まない)
+    card_header = (
+        f'<div class="card" style="margin-bottom:0.8rem;{spot_border}">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">'
+        f'<span style="font-size:0.7rem;color:#4b5563;">'
+        f'{spot_icon} {match["date"]} {match.get("time","?")} | {match.get("venue","?")}'
+        f'</span>'
+        f'<span>'
+        f'<span style="font-size:0.68rem;padding:2px 8px;border-radius:999px;border:1px solid;{cl_style[0]}">{cl_style[1]}</span>'
+        f'{draw_badge}{model_badge}'
+        f'<span style="font-size:0.62rem;padding:1px 5px;margin-left:3px;'
+        f'background:{dq_color}18;color:{dq_color};border-radius:4px;'
+        f'border:1px solid {dq_color}55;font-weight:700;cursor:help;"'
+        f' title="{dq_tooltip}">{dq_rank}</span>'
+        f'</span></div>'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.6rem;">'
+        f'<div style="text-align:left;flex:1;">'
+        f'<div style="font-size:1rem;{home_w}">🏠 {home}</div>'
+        f'<div style="font-size:0.65rem;color:#4b5563;">{_rank(home)} {hf_html}</div>'
+        f'</div>'
+        f'<div style="text-align:center;padding:0 0.8rem;">'
+        f'<div style="font-size:1.1rem;font-weight:900;color:#0f172a;">{winner_icon} {score}</div>'
+        f'</div>'
+        f'<div style="text-align:right;flex:1;">'
+        f'<div style="font-size:1rem;{away_w}">{away} ✈</div>'
+        f'<div style="font-size:0.65rem;color:#4b5563;">{_rank(away)} {af_html}</div>'
+        f'</div></div>'
+        f'<div style="border-radius:8px;overflow:hidden;display:flex;height:26px;margin-bottom:4px;">'
+        f'<div style="width:{h_pct}%;background:#3b82f6;display:flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:white;">{h_pct}%</div>'
+        f'<div style="width:{d_pct}%;background:#f59e0b;display:flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:white;">{d_pct}%</div>'
+        f'<div style="width:{a_pct}%;background:#ef4444;display:flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:white;">{a_pct}%</div>'
+        f'</div>'
+        f'<div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">'
+        f'<span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span></div>'
+        f'{_build_recommendation(cl, dq_rank, cls.get("draw_alert", False), h_pct, d_pct, a_pct)}'
+        f'{details_html}'
+        f'</div>'
+    )
+    st.markdown(card_header, unsafe_allow_html=True)
 
 
 def _build_recommendation(
