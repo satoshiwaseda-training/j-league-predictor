@@ -1045,7 +1045,7 @@ def render_onebutton(division: str):
 def _run_onebutton_pipeline(division: str, cache_key: str):
     """ワンボタン予測パイプライン: data_connectorで取得→予測→保存"""
     from datetime import datetime as _dt
-    from data_connector import run_data_pipeline, build_feature_snapshot
+    from data_connector import run_data_pipeline, build_feature_snapshot, compute_data_quality
 
     progress = st.progress(0.0, text="準備中...")
 
@@ -1128,10 +1128,12 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             closeness = contributions.get("closeness", 0.5)
             cls = _classify_prediction(prediction, closeness)
             gemini_used = "gemini" in str(prediction.get("model", "")).lower()
+            dq = compute_data_quality(pipeline, home_xg, away_xg, gemini_used)
             preds.append({
                 "match": match, "prediction": prediction,
                 "home_form": home_form, "away_form": away_form,
                 "classification": cls, "gemini_used": gemini_used,
+                "data_quality": dq,
             })
             snapshots.append(build_feature_snapshot(
                 match, prediction, contributions, pipeline, gemini_used,
@@ -1298,17 +1300,40 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
     hf_html = form_html(data.get("home_form", []))
     af_html = form_html(data.get("away_form", []))
 
-    # Geminiコメント（折りたたみ）
+    # データ品質ランクバッジ
+    dq = data.get("data_quality", {})
+    dq_rank = dq.get("rank", "?")
+    dq_color = dq.get("color", "#64748b")
+    dq_label = dq.get("label", "")
+    dq_note = dq.get("note", "")
+    dq_sources = dq.get("sources_used", [])
+    source_icons = " ".join(
+        {"順位表": "📊", "試合結果": "📋", "ELO": "📈", "xG": "🎯",
+         "規律": "🟨", "Gemini": "🤖"}.get(s, s) for s in dq_sources
+    )
+
+    # Geminiコメント + データ品質明細（折りたたみ）
     reasoning = pred.get("reasoning", "")
-    reasoning_html = ""
+    details_html = ""
+    # データ品質行
+    details_inner = (
+        f'<div style="font-size:0.66rem;color:#64748b;margin-top:0.3rem;">'
+        f'<b>利用データ:</b> {", ".join(dq_sources) if dq_sources else "なし"}<br>'
+        f'<b>品質:</b> {dq_label} — {dq_note}'
+        f'</div>'
+    )
     if reasoning:
-        short = reasoning[:60] + "..." if len(reasoning) > 60 else reasoning
-        reasoning_html = (
-            f'<details style="margin-top:0.4rem;">'
-            f'<summary style="font-size:0.68rem;color:#64748b;cursor:pointer;">AI分析を見る</summary>'
-            f'<div style="font-size:0.68rem;color:#374151;margin-top:0.3rem;line-height:1.5;">{reasoning}</div>'
-            f'</details>'
+        details_inner += (
+            f'<div style="font-size:0.68rem;color:#374151;margin-top:0.4rem;'
+            f'line-height:1.5;border-top:1px solid #e5e7eb;padding-top:0.3rem;">{reasoning}</div>'
         )
+    details_html = (
+        f'<details style="margin-top:0.4rem;">'
+        f'<summary style="font-size:0.68rem;color:#64748b;cursor:pointer;">'
+        f'{source_icons} 詳細を見る</summary>'
+        f'{details_inner}'
+        f'</details>'
+    )
 
     st.markdown(f"""
     <div class="card" style="margin-bottom:0.8rem;">
@@ -1321,6 +1346,9 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
                        border:1px solid;{cl_style[0]}">{cl_style[1]}</span>
           {draw_badge}
           {model_badge}
+          <span style="font-size:0.62rem;padding:1px 5px;margin-left:3px;
+                       background:{dq_color}18;color:{dq_color};border-radius:4px;
+                       border:1px solid {dq_color}55;font-weight:700;">{dq_rank}</span>
         </span>
       </div>
 
@@ -1355,7 +1383,7 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
       <div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">
         <span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span>
       </div>
-      {reasoning_html}
+      {details_html}
     </div>
     """, unsafe_allow_html=True)
 

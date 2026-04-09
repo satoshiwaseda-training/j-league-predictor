@@ -320,6 +320,82 @@ def run_data_pipeline(division: str = "j1", progress_cb=None) -> PipelineSnapsho
 # Feature Snapshot (予測時の特徴量スナップショット)
 # ────────────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────────────
+# データ品質ランク (試合単位)
+# ────────────────────────────────────────────────────────
+
+def compute_data_quality(
+    pipeline: PipelineSnapshot,
+    home_xg: dict | None,
+    away_xg: dict | None,
+    gemini_used: bool = False,
+) -> dict:
+    """
+    試合単位のデータ品質ランクを算出する。
+
+    A: 公式データ + xG + ELO + Gemini (全ソース利用)
+    B: 公式データ + ELO + (xG or Gemini のどちらかが欠落)
+    C: 公式データのみ (xG/Gemini なし)
+    D: 公式データも不完全 (順位表なし等)
+
+    Returns: {rank, label, color, sources_used, note}
+    """
+    has_standings = pipeline.standings.success
+    has_results = pipeline.results.success
+    has_elo = pipeline.elo.success and bool(pipeline.elo.data)
+    has_xg = bool(home_xg) or bool(away_xg)
+    has_discipline = pipeline.discipline.success and bool(pipeline.discipline.data)
+
+    sources = []
+    if has_standings:
+        sources.append("順位表")
+    if has_results:
+        sources.append("試合結果")
+    if has_elo:
+        sources.append("ELO")
+    if has_xg:
+        sources.append("xG")
+    if has_discipline:
+        sources.append("規律")
+    if gemini_used:
+        sources.append("Gemini")
+
+    official_ok = has_standings and has_results
+
+    if official_ok and has_elo and has_xg and gemini_used:
+        rank, label, color = "A", "最高品質", "#16a34a"
+        note = "全データソース利用"
+    elif official_ok and has_elo and (has_xg or gemini_used):
+        rank, label, color = "B", "高品質", "#2563eb"
+        note = "xG未取得" if not has_xg else ("Gemini未使用" if not gemini_used else "")
+    elif official_ok:
+        rank, label, color = "C", "公式データ中心", "#ca8a04"
+        note = "公式データ中心の簡略版予測"
+    else:
+        rank, label, color = "D", "データ不足", "#dc2626"
+        missing = []
+        if not has_standings:
+            missing.append("順位表")
+        if not has_results:
+            missing.append("試合結果")
+        note = f"未取得: {', '.join(missing)}"
+
+    return {
+        "rank": rank,
+        "label": label,
+        "color": color,
+        "sources_used": sources,
+        "note": note,
+        "gemini_used": gemini_used,
+        "has_xg": has_xg,
+        "has_elo": has_elo,
+    }
+
+
+# ────────────────────────────────────────────────────────
+# Feature Snapshot (予測時の特徴量スナップショット)
+# ────────────────────────────────────────────────────────
+
 def build_feature_snapshot(
     match: dict,
     prediction: dict,
