@@ -1603,29 +1603,76 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
       <div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">
         <span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span>
       </div>
-      {_build_action_badge(cl, dq_rank, cls.get("draw_alert", False))}
+      {_build_recommendation(cl, dq_rank, cls.get("draw_alert", False), h_pct, d_pct, a_pct)}
       {details_html}
     </div>
     """, unsafe_allow_html=True)
 
 
-def _build_action_badge(confidence: str, dq_rank: str, draw_alert: bool) -> str:
-    """中確信の場合のみ推奨アクションバッジを返す"""
-    if confidence != "medium":
-        return ""
-    if dq_rank in ("A", "B") and not draw_alert:
-        icon, text, bg, border, color = "🎯", "組み合わせ向き", "#eff6ff", "#bfdbfe", "#1d4ed8"
-    elif draw_alert:
-        icon, text, bg, border, color = "⚡", "波乱狙い", "#fefce8", "#fef08a", "#a16207"
-    elif dq_rank in ("C", "D"):
-        icon, text, bg, border, color = "⏭", "スキップ推奨", "#f1f5f9", "#cbd5e1", "#64748b"
-    else:
-        return ""
+def _build_recommendation(
+    confidence: str, dq_rank: str, draw_alert: bool,
+    h_pct: int, d_pct: int, a_pct: int,
+) -> str:
+    """最終推奨バッジを生成。高確信=第一のみ、中/低確信=第一+第二。"""
+
+    # ── 第一推奨 (argmax) ──
+    probs = {"home": h_pct, "draw": d_pct, "away": a_pct}
+    sorted_cls = sorted(probs.items(), key=lambda x: -x[1])
+    first_cls, first_pct = sorted_cls[0]
+    second_cls, second_pct = sorted_cls[1]
+
+    first_label = {"home": "ホーム勝ち", "draw": "引き分け", "away": "アウェー勝ち"}[first_cls]
+
+    # ── スタイル決定 ──
+    if confidence == "high":
+        style_icon, style_text = "🔒", "本命向き"
+        style_bg, style_border, style_color = "#dcfce7", "#86efac", "#15803d"
+    elif confidence == "medium":
+        if dq_rank in ("A", "B") and not draw_alert:
+            style_icon, style_text = "🎯", "組み合わせ向き"
+            style_bg, style_border, style_color = "#eff6ff", "#bfdbfe", "#1d4ed8"
+        elif draw_alert:
+            style_icon, style_text = "⚡", "波乱狙い"
+            style_bg, style_border, style_color = "#fefce8", "#fef08a", "#a16207"
+        else:
+            style_icon, style_text = "⏭", "スキップ推奨"
+            style_bg, style_border, style_color = "#f1f5f9", "#cbd5e1", "#64748b"
+    else:  # low
+        style_icon, style_text = "⏭", "見送り推奨"
+        style_bg, style_border, style_color = "#f1f5f9", "#cbd5e1", "#64748b"
+
+    # 第一推奨バッジ
+    first_html = (
+        f'<span style="font-size:0.68rem;padding:2px 10px;'
+        f'background:{style_bg};color:{style_color};border:1px solid {style_border};'
+        f'border-radius:999px;">'
+        f'{style_icon} {first_label} {first_pct}% — {style_text}</span>'
+    )
+
+    # ── 第二推奨 (中確信・低確信のみ) ──
+    second_html = ""
+    if confidence != "high":
+        # draw警戒時はdrawを第二推奨に優先
+        if draw_alert and second_cls != "draw" and d_pct >= second_pct - 3:
+            second_cls = "draw"
+            second_pct = d_pct
+
+        second_label_map = {
+            "draw": "引き分け寄り",
+            "home": "勝敗寄り (ホーム勝ち)",
+            "away": "勝敗寄り (アウェー勝ち)",
+        }
+        second_label = second_label_map.get(second_cls, "")
+        second_html = (
+            f'<span style="font-size:0.62rem;padding:1px 8px;margin-left:4px;'
+            f'background:#f8fafc;color:#64748b;border:1px solid #e2e8f0;'
+            f'border-radius:999px;">'
+            f'2nd: {second_label} {second_pct}%</span>'
+        )
+
     return (
         f'<div style="margin-top:0.35rem;text-align:right;">'
-        f'<span style="font-size:0.66rem;padding:2px 10px;'
-        f'background:{bg};color:{color};border:1px solid {border};'
-        f'border-radius:999px;">{icon} {text}</span>'
+        f'{first_html}{second_html}'
         f'</div>'
     )
 
