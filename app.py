@@ -1603,9 +1603,31 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
       <div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">
         <span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span>
       </div>
+      {_build_action_badge(cl, dq_rank, cls.get("draw_alert", False))}
       {details_html}
     </div>
     """, unsafe_allow_html=True)
+
+
+def _build_action_badge(confidence: str, dq_rank: str, draw_alert: bool) -> str:
+    """中確信の場合のみ推奨アクションバッジを返す"""
+    if confidence != "medium":
+        return ""
+    if dq_rank in ("A", "B") and not draw_alert:
+        icon, text, bg, border, color = "🎯", "組み合わせ向き", "#eff6ff", "#bfdbfe", "#1d4ed8"
+    elif draw_alert:
+        icon, text, bg, border, color = "⚡", "波乱狙い", "#fefce8", "#fef08a", "#a16207"
+    elif dq_rank in ("C", "D"):
+        icon, text, bg, border, color = "⏭", "スキップ推奨", "#f1f5f9", "#cbd5e1", "#64748b"
+    else:
+        return ""
+    return (
+        f'<div style="margin-top:0.35rem;text-align:right;">'
+        f'<span style="font-size:0.66rem;padding:2px 10px;'
+        f'background:{bg};color:{color};border:1px solid {border};'
+        f'border-radius:999px;">{icon} {text}</span>'
+        f'</div>'
+    )
 
 
 # ─── 全試合予測カード ─────────────────────────────────────
