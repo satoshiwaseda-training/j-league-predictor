@@ -1043,40 +1043,37 @@ def render_onebutton(division: str):
 
 
 def _run_onebutton_pipeline(division: str, cache_key: str):
-    """ワンボタン予測パイプライン: データ取得→予測→保存"""
+    """ワンボタン予測パイプライン: data_connectorで取得→予測→保存"""
     from datetime import datetime as _dt
+    from data_connector import run_data_pipeline, build_feature_snapshot
 
     progress = st.progress(0.0, text="準備中...")
-    fetch_log = []
-    total_steps = 6
 
-    # Step 1: 試合スケジュール
-    r = _fetch_step("試合スケジュール取得", lambda: cached_matches(division), progress, 1, total_steps)
-    fetch_log.append(r)
-    matches = r["data"] if r["success"] else []
+    def _progress_cb(step, total, label):
+        progress.progress(step / (total + 2), text=label)
 
-    # Step 2: 順位表
-    r = _fetch_step("順位表取得", lambda: cached_standings(division), progress, 2, total_steps)
-    fetch_log.append(r)
-    standings = r["data"] if r["success"] else pd.DataFrame()
+    # ── データ取得 (data_connector に委譲) ──
+    pipeline = run_data_pipeline(division, progress_cb=_progress_cb)
 
-    # Step 3: xG / カード / 過去結果
-    r = _fetch_step("詳細データ取得", lambda: {
-        "xg": cached_fbref_xg(division),
-        "cards": cached_discipline(division),
-        "past": cached_past_results(division),
-        "elo_ratings": cached_elo_ratings(division),
-    }, progress, 3, total_steps)
-    fetch_log.append(r)
-    detail = r["data"] if r["success"] else {"xg": {}, "cards": {}, "past": [], "elo_ratings": {}}
+    matches = pipeline.fixtures.data or []
+    standings = pipeline.standings.data if pipeline.standings.success else pd.DataFrame()
+    xg_data = pipeline.xg.data or {}
+    cards_data = pipeline.discipline.data or {}
+    past = pipeline.results.data or []
+    elo_ratings = pipeline.elo.data or {}
 
     if not matches:
         progress.empty()
         st.warning("試合スケジュールが取得できませんでした")
         return
 
-    # Step 4-5: 全試合予測
-    progress.progress(4 / total_steps, text=f"全{len(matches)}試合を予測中...")
+    # ELOスコア計算ヘルパー
+    def _elo_scores(home: str, away: str) -> tuple[float, float]:
+        initial, hb = 1500.0, 50.0
+        rh = elo_ratings.get(home, initial) + hb
+        ra = elo_ratings.get(away, initial)
+        eh = 1.0 / (1.0 + 10.0 ** ((ra - rh) / 400.0))
+        return eh, 1.0 - eh
 
     def _row(team: str) -> dict:
         if isinstance(standings, pd.DataFrame) and not standings.empty:
@@ -1084,15 +1081,14 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             return r.iloc[0].to_dict() if not r.empty else {}
         return {}
 
-    xg_data = detail.get("xg", {})
-    cards_data = detail.get("cards", {})
-    past = detail.get("past", [])
-
+    # ── 全試合予測 ──
+    total_p = len(matches)
     preds = []
+    snapshots = []
     for i, match in enumerate(matches):
         home, away = match["home"], match["away"]
-        progress.progress((4 + (i / len(matches))) / total_steps,
-                          text=f"予測中 {i+1}/{len(matches)}: {home} vs {away}")
+        progress.progress((7 + (i / total_p)) / (8 + 1),
+                          text=f"予測中 {i+1}/{total_p}: {home} vs {away}")
         try:
             home_stats = _row(home)
             away_stats = _row(away)
@@ -1110,7 +1106,7 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             away_cards = cards_data.get(away, {})
             home_days = calc_match_interval(home, match["date"], past)
             away_days = calc_match_interval(away, match["date"], past)
-            elo_h, elo_a = get_elo_scores(division, home, away)
+            elo_h, elo_a = _elo_scores(home, away)
 
             contributions = calculate_parameter_contributions(
                 home, away, home_stats, away_stats, home_form, away_form,
@@ -1131,29 +1127,31 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             )
             closeness = contributions.get("closeness", 0.5)
             cls = _classify_prediction(prediction, closeness)
+            gemini_used = "gemini" in str(prediction.get("model", "")).lower()
             preds.append({
                 "match": match, "prediction": prediction,
                 "home_form": home_form, "away_form": away_form,
-                "classification": cls,
+                "classification": cls, "gemini_used": gemini_used,
             })
-            # 予測履歴に自動保存
+            snapshots.append(build_feature_snapshot(
+                match, prediction, contributions, pipeline, gemini_used,
+            ))
             store_save(division, match, prediction)
         except Exception as exc:
             preds.append({"match": match, "error": str(exc),
                           "classification": {"confidence_level": "low", "draw_alert": False}})
 
-    # Step 6: 完了
     progress.progress(1.0, text="完了!")
     progress.empty()
 
-    # セッションに保存
-    skipped = [f["label"] for f in fetch_log if not f["success"]]
     st.session_state[cache_key] = {
         "preds": preds,
         "standings": standings,
-        "fetched_at": _dt.now().isoformat(),
-        "skipped": skipped,
+        "pipeline_summary": pipeline.source_summary,
+        "skipped": pipeline.skipped_names,
+        "fetched_at": pipeline.generated_at,
         "n_matches": len(matches),
+        "snapshots": snapshots,
     }
     st.rerun()
 
@@ -1166,24 +1164,31 @@ def _render_onebutton_results(result: dict, division: str):
     skipped = result.get("skipped", [])
 
     # ── 鮮度パネル ──
-    skip_badges = ""
-    for s in skipped:
-        skip_badges += (
-            f'<span style="font-size:0.72rem;padding:3px 10px;background:#fef2f2;'
-            f'border:1px solid #fecaca;border-radius:999px;color:#dc2626;">Skip: {s}</span>'
-        )
     time_display = fetched_at[:16].replace("T", " ") if len(fetched_at) >= 16 else fetched_at
+    source_badges = ""
+    for item in result.get("pipeline_summary", []):
+        c = item.get("color", "#64748b")
+        source_badges += (
+            f'<span style="font-size:0.68rem;padding:2px 8px;margin:1px;'
+            f'background:{c}15;border:1px solid {c}55;border-radius:999px;color:{c};">'
+            f'{item["name"]}: {item["badge"]}'
+            f'</span>'
+        )
     st.markdown(f"""
-    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.8rem;">
-      <span style="font-size:0.72rem;padding:3px 10px;background:#f0fdf4;border:1px solid #bbf7d0;
-                   border-radius:999px;color:#15803d;">
-        更新: {time_display}
-      </span>
-      <span style="font-size:0.72rem;padding:3px 10px;background:#eff6ff;border:1px solid #bfdbfe;
-                   border-radius:999px;color:#1d4ed8;">
-        {result['n_matches']}試合
-      </span>
-      {skip_badges}
+    <div style="margin-bottom:0.8rem;">
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center;margin-bottom:0.4rem;">
+        <span style="font-size:0.72rem;padding:3px 10px;background:#f0fdf4;border:1px solid #bbf7d0;
+                     border-radius:999px;color:#15803d;">
+          更新: {time_display}
+        </span>
+        <span style="font-size:0.72rem;padding:3px 10px;background:#eff6ff;border:1px solid #bfdbfe;
+                     border-radius:999px;color:#1d4ed8;">
+          {result['n_matches']}試合
+        </span>
+      </div>
+      <div style="display:flex;gap:0.3rem;flex-wrap:wrap;">
+        {source_badges}
+      </div>
     </div>""", unsafe_allow_html=True)
 
     # ── サマリーカウント ──
@@ -1260,6 +1265,17 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         draw_badge = ('<span style="font-size:0.68rem;padding:2px 8px;margin-left:4px;'
                       'background:#fef3c7;color:#92400e;border-radius:999px;'
                       'border:1px solid #fbbf24;">Draw警戒</span>')
+    # Gemini / 統計モデル バッジ
+    gemini_used = data.get("gemini_used", False)
+    model_badge = (
+        '<span style="font-size:0.6rem;padding:1px 6px;margin-left:3px;'
+        'background:#ede9fe;color:#7c3aed;border-radius:999px;'
+        'border:1px solid #c4b5fd;">Gemini</span>'
+    ) if gemini_used else (
+        '<span style="font-size:0.6rem;padding:1px 6px;margin-left:3px;'
+        'background:#f0f9ff;color:#0284c7;border-radius:999px;'
+        'border:1px solid #7dd3fc;">統計</span>'
+    )
 
     # 勝者ハイライト
     if h_pct >= a_pct and h_pct >= d_pct:
@@ -1304,6 +1320,7 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
           <span style="font-size:0.68rem;padding:2px 8px;border-radius:999px;
                        border:1px solid;{cl_style[0]}">{cl_style[1]}</span>
           {draw_badge}
+          {model_badge}
         </span>
       </div>
 
