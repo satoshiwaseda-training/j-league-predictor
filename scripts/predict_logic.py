@@ -26,34 +26,35 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ─── Gemini v7 設計重み (2026-04-09 第6回設計会議) ─────
+# ─── Gemini v8 設計重み (2026-04-10 第7回設計会議) ─────
 # 重み合計 = 1.00
-# 変更: 死にパラメータ6個を0化、ELO=0.13 (val=2025で全指標最良地点)
-# 検証: 804試合 (2024+2025+2026), val=377試合でELO重みスイープ実施
+# 変更: ELO 0.13→0.25 (新ファクター+再最適化)
+# 新ファクター: チーム別ホームADV, H2H実データ, 昇格組補正
+# 検証: 804試合, val=377, 2026holdout=41
 MODEL_WEIGHTS: dict[str, float] = {
-    "team_strength":                0.1260,  # 勝点・順位差
-    "attack_rate":                  0.0856,  # 得点率/試合 (Dixon-Coles lambda)
-    "defense_rate":                 0.0640,  # 失点率/試合 (Dixon-Coles mu)
-    "recent_form":                  0.1456,  # 直近フォームPPG
-    "xg_for":                       0.0325,  # 期待得点 (攻撃力)
-    "xg_against":                   0.0325,  # 期待失点 (守備力)
-    "home_advantage":               0.0856,  # ホームADV
-    "capital_power":                0.1063,  # 資本力 (R2=0.65-0.72 vs 勝点)
-    "head_to_head":                 0.0325,  # H2H (Cohen's d小)
-    "discipline_risk":              0.0325,  # 規律・カード累積リスク
-    "attrition_rate":               0.0325,  # 損耗率 (スカッド比率)
-    "match_interval":               0.0325,  # 試合間隔疲労 U字型
-    "injury_impact":                0.0098,  # 個別怪我絶対数
-    "weather_fatigue":              0.0098,  # 天気疲労 (効果小)
+    "team_strength":                0.1086,  # 勝点・順位差
+    "attack_rate":                  0.0738,  # 得点率/試合 (Dixon-Coles lambda)
+    "defense_rate":                 0.0552,  # 失点率/試合 (Dixon-Coles mu)
+    "recent_form":                  0.1257,  # 直近フォームPPG
+    "xg_for":                       0.0280,  # 期待得点 (攻撃力)
+    "xg_against":                   0.0280,  # 期待失点 (守備力)
+    "home_advantage":               0.0738,  # チーム別ホームADV
+    "capital_power":                0.0916,  # 資本力 (R2=0.65-0.72 vs 勝点)
+    "head_to_head":                 0.0280,  # H2H (実データ化済み)
+    "discipline_risk":              0.0280,  # 規律・カード累積リスク
+    "attrition_rate":               0.0280,  # 損耗率 (スカッド比率)
+    "match_interval":               0.0280,  # 試合間隔疲労 U字型
+    "injury_impact":                0.0084,  # 個別怪我絶対数
+    "weather_fatigue":              0.0084,  # 天気疲労 (効果小)
     "travel_distance":              0.0000,  # 移動距離 (実質0)
-    "set_piece_conversion":         0.0000,  # (inactive: データ供給元なし)
-    "match_day_motivation":         0.0000,  # (inactive: データ供給元なし)
-    "tactical_adaptability":        0.0000,  # (inactive: データ供給元なし)
-    "expected_goals_difference":    0.0423,  # xGD
-    "player_availability_impact":   0.0000,  # (inactive: データ供給元なし)
-    "match_trend":                  0.0000,  # (inactive: データ供給元なし)
-    "referee_tendency":             0.0000,  # (inactive: データ供給元なし)
-    "elo":                          0.1300,  # ELOレーティング (val=2025最適値)
+    "set_piece_conversion":         0.0000,  # (inactive)
+    "match_day_motivation":         0.0000,  # (inactive)
+    "tactical_adaptability":        0.0000,  # (inactive)
+    "expected_goals_difference":    0.0365,  # xGD
+    "player_availability_impact":   0.0000,  # (inactive)
+    "match_trend":                  0.0000,  # (inactive)
+    "referee_tendency":             0.0000,  # (inactive)
+    "elo":                          0.2500,  # ELOレーティング (v8最適値)
 }
 
 # ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
@@ -793,12 +794,13 @@ def _softmax3(lh: float, ld: float, la: float) -> tuple[float, float, float]:
 
 
 # 3ロジット変換のパラメータ (v7再探索済み, val=2025 F1=0.435)
+# 3ロジット変換パラメータ (v8 再最適化済み, val=2025 F1=0.419 logL=1.047)
 _3LOGIT_PARAMS = {
-    "scale_ha":   1.44,    # 勝敗方向の感度
-    "bias_home":  0.14,    # ホームバイアス
+    "scale_ha":   1.70,    # 勝敗方向の感度 (v7:1.44 → 新ファクター対応で拡大)
+    "bias_home":  0.10,    # ホームバイアス (v7:0.14 → チーム別ADV導入で縮小)
     "bias_away":  0.07,    # アウェイバイアス
-    "scale_draw": 0.80,    # draw感度 (v6:1.01 -> 安定化)
-    "bias_draw":  -0.60,   # drawベースロジット (v6:-0.82 -> draw増加)
+    "scale_draw": 1.50,    # draw感度 (v7:0.80 → draw recall改善のため拡大)
+    "bias_draw":  -1.20,   # drawベースロジット (v7:-0.60 → draw数適正化)
 }
 
 
