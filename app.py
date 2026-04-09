@@ -1246,11 +1246,35 @@ def _render_onebutton_results(result: dict, division: str):
     elif filter_opt == "低確信":
         preds_f = [p for p in preds if p.get("classification", {}).get("confidence_level") == "low"]
     else:
-        preds_f = preds
+        preds_f = list(preds)
 
     if not preds_f:
         st.info("該当する試合がありません")
         return
+
+    # ── ソート: 高確信 → draw警戒 → その他 ──
+    def _sort_key(p):
+        cl = p.get("classification", {}).get("confidence_level", "low")
+        da = p.get("classification", {}).get("draw_alert", False)
+        # 高確信=0, draw警戒(非高確信)=1, 中確信=2, 低確信=3
+        if cl == "high":
+            return (0, 0)
+        if da:
+            return (1, 0)
+        if cl == "medium":
+            return (2, 0)
+        return (3, 0)
+
+    preds_f.sort(key=_sort_key)
+
+    # ── Dランク試合があれば再取得ボタン ──
+    n_d = sum(1 for p in preds_f if p.get("data_quality", {}).get("rank") == "D")
+    if n_d > 0:
+        st.warning(f"{n_d}試合でデータ品質がDランクです。再取得で改善する可能性があります。")
+        if st.button("🔄 再取得して再予測", key="retry_d_rank"):
+            cache_key = f"onebutton_{division}"
+            st.session_state.pop(cache_key, None)
+            st.rerun()
 
     # ── カード表示 ──
     for i in range(0, len(preds_f), 2):
@@ -1340,14 +1364,22 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
          "規律": "🟨", "Gemini": "🤖"}.get(s, s) for s in dq_sources
     )
 
-    # Dランク時の警告バナー
+    # 品質ランクのツールチップ説明
+    dq_tooltip = {
+        "A": "全ソース利用: 公式データ+xG+ELO+Gemini",
+        "B": "高品質: 公式データ+ELO。xGまたはGeminiの片方が未使用",
+        "C": "公式データ中心: xG・Gemini未使用の簡略版",
+        "D": "データ不足: 順位表等の公式データが取得できていません",
+    }.get(dq_rank, "")
+
+    # Dランク/Cランク時の警告バナー
     d_rank_warning = ""
     if dq_rank == "D":
         d_rank_warning = (
             '<div style="margin-top:0.4rem;padding:0.35rem 0.6rem;background:#fef2f2;'
             'border:1px solid #fecaca;border-radius:6px;font-size:0.68rem;color:#991b1b;">'
             'データ不足のため参考度が低い予測です。'
-            '「🚀 最新データ更新して予測する」で再取得をお試しください。'
+            '上部の「🚀 最新データ更新して予測する」ボタンで再取得してください。'
             '</div>'
         )
     elif dq_rank == "C":
@@ -1355,6 +1387,15 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
             '<div style="margin-top:0.4rem;padding:0.3rem 0.6rem;background:#fefce8;'
             'border:1px solid #fef08a;border-radius:6px;font-size:0.66rem;color:#854d0e;">'
             'xG・Gemini未使用の公式データ中心の簡略版予測です'
+            '</div>'
+        )
+
+    # 高確信 × 低品質 (C/D) の矛盾警告
+    if cl == "high" and dq_rank in ("C", "D"):
+        d_rank_warning += (
+            '<div style="margin-top:0.3rem;padding:0.3rem 0.6rem;background:#fff7ed;'
+            'border:1px solid #fed7aa;border-radius:6px;font-size:0.66rem;color:#9a3412;">'
+            '高確信ですがデータ品質が低いため、過信に注意してください'
             '</div>'
         )
 
@@ -1393,7 +1434,8 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
           {model_badge}
           <span style="font-size:0.62rem;padding:1px 5px;margin-left:3px;
                        background:{dq_color}18;color:{dq_color};border-radius:4px;
-                       border:1px solid {dq_color}55;font-weight:700;">{dq_rank}</span>
+                       border:1px solid {dq_color}55;font-weight:700;cursor:help;"
+                 title="{dq_tooltip}">{dq_rank}</span>
         </span>
       </div>
 
