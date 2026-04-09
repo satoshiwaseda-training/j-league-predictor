@@ -995,7 +995,7 @@ def _classify_prediction(pred: dict, closeness: float = 0.5) -> dict:
 
 
 def _render_spotlight(valid_preds: list[dict]):
-    """今日の注目試合セクション: 堅い/波乱/要注意の3分類"""
+    """今日の注目試合セクション: 堅い/波乱/要注意の3分類 + 理由付き"""
     if not valid_preds:
         return
 
@@ -1005,19 +1005,28 @@ def _render_spotlight(valid_preds: list[dict]):
         cls = p.get("classification", {})
         mx = cls.get("max_prob", 0)
         da = cls.get("draw_alert", False)
+        closeness = cls.get("closeness", 0.5)
         home = p["match"]["home"]
         away = p["match"]["away"]
         label = f"{home} vs {away}"
         h = int(pred.get("home_win_prob", 40))
         d = int(pred.get("draw_prob", 25))
         a = int(pred.get("away_win_prob", 35))
+        match_key = f"{home}_{away}"
 
         if mx >= 50:
-            solid.append((label, h, d, a))
+            fav = home if h >= a else away
+            reason = f"{fav}優勢 (確率{mx}%)"
+            solid.append((label, h, d, a, reason))
+            p["_spotlight"] = "solid"
         elif da:
-            caution.append((label, h, d, a))
+            reason = f"実力接近 (接近度{closeness:.2f})"
+            caution.append((label, h, d, a, reason))
+            p["_spotlight"] = "caution"
         elif abs(h - a) <= 8:
-            upset.append((label, h, d, a))
+            reason = f"僅差 (H{h}% vs A{a}%)"
+            upset.append((label, h, d, a, reason))
+            p["_spotlight"] = "upset"
 
     if not solid and not upset and not caution:
         return
@@ -1026,13 +1035,14 @@ def _render_spotlight(valid_preds: list[dict]):
         if not items:
             return ""
         cards = ""
-        for name, h, d, a in items[:3]:
+        for name, h, d, a, reason in items[:3]:
             cards += (
                 f'<div style="font-size:0.7rem;padding:2px 0;">'
-                f'{name} <span style="color:#64748b;">({h}-{d}-{a})</span></div>'
+                f'{name} <span style="color:#64748b;">({h}-{d}-{a})</span><br>'
+                f'<span style="font-size:0.6rem;color:{color}99;">{reason}</span></div>'
             )
         return (
-            f'<div style="flex:1;min-width:160px;padding:0.5rem 0.7rem;'
+            f'<div style="flex:1;min-width:180px;padding:0.5rem 0.7rem;'
             f'background:{bg};border:1px solid {border};border-radius:8px;">'
             f'<div style="font-size:0.75rem;font-weight:700;color:{color};margin-bottom:0.3rem;">'
             f'{emoji} {title}</div>{cards}</div>'
@@ -1270,16 +1280,20 @@ def _render_onebutton_results(result: dict, division: str):
     past_preds = store_load_all()
     past_stats = get_accuracy_stats(past_preds)
     acc_text = ""
+    acc_n = past_stats.get("with_actual", 0)
     if past_stats.get("accuracy") is not None:
         acc_pct = round(past_stats["accuracy"] * 100, 1)
-        acc_text = f"{acc_pct}% ({past_stats['correct']}/{past_stats['with_actual']})"
+        acc_text = f"{acc_pct}%"
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("高確信", f"{n_high}試合", help="max_prob >= 50%")
     c2.metric("中確信", f"{n_mid}試合", help="max_prob 40-50%")
     c3.metric("低確信", f"{n_low}試合", help="max_prob < 40%")
     c4.metric("Draw警戒", f"{n_draw}試合", help="draw >= 25% かつ closeness >= 0.5")
-    c5.metric("直近正答率", acc_text or "--", help="成績記録タブで結果登録後に表示")
+    c5.metric("直近正答率", acc_text or "--",
+              delta=f"n={acc_n}" if acc_n else None,
+              delta_color="off",
+              help="成績記録タブで結果登録後に表示")
 
     # ── 今日の注目試合 ──
     _render_spotlight(valid)
@@ -1485,7 +1499,16 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
     gem_diff = data.get("gemini_diff")
     stat_prior = data.get("stat_prior", {})
     gemini_diff_html = ""
+    gemini_large_warning = ""
     if gem_diff and gemini_used:
+        max_abs_diff = max(abs(gem_diff.get("home", 0)), abs(gem_diff.get("draw", 0)), abs(gem_diff.get("away", 0)))
+        if max_abs_diff >= 10:
+            gemini_large_warning = (
+                '<div style="margin-top:0.3rem;padding:0.25rem 0.5rem;background:#faf5ff;'
+                'border:1px solid #e9d5ff;border-radius:6px;font-size:0.64rem;color:#7c3aed;">'
+                f'Geminiが統計モデルから大きく補正しています (最大{max_abs_diff}pp)'
+                '</div>'
+            )
         def _sign(v):
             return f"+{v}" if v > 0 else str(v)
         gemini_diff_html = (
@@ -1511,6 +1534,7 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         )
     details_html = (
         f'{d_rank_warning}'
+        f'{gemini_large_warning}'
         f'<details style="margin-top:0.4rem;">'
         f'<summary style="font-size:0.68rem;color:#64748b;cursor:pointer;">'
         f'{source_icons} 詳細を見る</summary>'
@@ -1518,11 +1542,20 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         f'</details>'
     )
 
+    # 注目試合ハイライト
+    spotlight = data.get("_spotlight", "")
+    spot_icon = {"solid": "🔒", "upset": "⚡", "caution": "⚠"}.get(spotlight, "")
+    spot_border = {
+        "solid": "border-left:3px solid #16a34a;",
+        "upset": "border-left:3px solid #dc2626;",
+        "caution": "border-left:3px solid #eab308;",
+    }.get(spotlight, "")
+
     st.markdown(f"""
-    <div class="card" style="margin-bottom:0.8rem;">
+    <div class="card" style="margin-bottom:0.8rem;{spot_border}">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
         <span style="font-size:0.7rem;color:#4b5563;">
-          {match['date']} {match.get('time','?')} | {match.get('venue','?')}
+          {spot_icon} {match['date']} {match.get('time','?')} | {match.get('venue','?')}
         </span>
         <span>
           <span style="font-size:0.68rem;padding:2px 8px;border-radius:999px;
