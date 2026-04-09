@@ -1392,10 +1392,11 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
 
     pred = data["prediction"]
     cls = data.get("classification", {})
+    import html as _html_mod
     h_pct = int(pred.get("home_win_prob", 40))
     d_pct = int(pred.get("draw_prob", 25))
     a_pct = int(pred.get("away_win_prob", 35))
-    score = pred.get("predicted_score", "?-?")
+    score = _html_mod.escape(str(pred.get("predicted_score", "?-?")))
 
     # 確信度バッジ
     cl = cls.get("confidence_level", "medium")
@@ -1448,21 +1449,22 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
     dq = data.get("data_quality", {})
     dq_rank = dq.get("rank", "?")
     dq_color = dq.get("color", "#64748b")
-    dq_label = dq.get("label", "")
-    dq_note = dq.get("note", "")
+    dq_label = _html_mod.escape(str(dq.get("label", "")))
+    dq_note = _html_mod.escape(str(dq.get("note", "")))
     dq_sources = dq.get("sources_used", [])
     source_icons = " ".join(
         {"順位表": "📊", "試合結果": "📋", "ELO": "📈", "xG": "🎯",
          "規律": "🟨", "Gemini": "🤖"}.get(s, s) for s in dq_sources
     )
 
-    # 品質ランクのツールチップ説明
-    dq_tooltip = {
+    # 品質ランクのツールチップ説明 (title属性用なのでHTMLエスケープ)
+    import html as _html_mod
+    dq_tooltip = _html_mod.escape({
         "A": "全ソース利用: 公式データ+xG+ELO+Gemini",
         "B": "高品質: 公式データ+ELO。xGまたはGeminiの片方が未使用",
         "C": "公式データ中心: xG・Gemini未使用の簡略版",
         "D": "データ不足: 順位表等の公式データが取得できていません",
-    }.get(dq_rank, "")
+    }.get(dq_rank, ""))
 
     # Dランク/Cランク時の警告バナー
     dq_missing = dq.get("missing", [])
@@ -1494,7 +1496,8 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         )
 
     # データ品質明細 + AI分析（折りたたみ）
-    reasoning = pred.get("reasoning", "")
+    import html as _html_mod
+    reasoning = _html_mod.escape(str(pred.get("reasoning", "")))
     # Gemini補正の影響
     gem_diff = data.get("gemini_diff")
     stat_prior = data.get("stat_prior", {})
