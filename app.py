@@ -975,6 +975,374 @@ def render_prediction(match: dict, division: str):
             st.info(f"3Dグラフ描画スキップ: {e}")
 
 
+# ─── ワンボタン予測パイプライン ────────────────────────────
+
+def _classify_prediction(pred: dict, closeness: float = 0.5) -> dict:
+    """予測の確信度とdraw警戒を判定"""
+    h = int(pred.get("home_win_prob", 40))
+    d = int(pred.get("draw_prob", 25))
+    a = int(pred.get("away_win_prob", 35))
+    mx = max(h, d, a)
+    if mx >= 50:
+        confidence_level = "high"
+    elif mx >= 40:
+        confidence_level = "medium"
+    else:
+        confidence_level = "low"
+    draw_alert = d >= 25 and closeness >= 0.5
+    return {"confidence_level": confidence_level, "draw_alert": draw_alert,
+            "max_prob": mx, "closeness": closeness}
+
+
+def _fetch_step(label: str, fn, progress_bar, step: int, total: int):
+    """データ取得ステップを実行し結果を返す。失敗時はNone。"""
+    progress_bar.progress(step / total, text=f"{label}...")
+    try:
+        result = fn()
+        return {"success": True, "data": result, "label": label}
+    except Exception as e:
+        return {"success": False, "data": None, "label": label, "error": str(e)}
+
+
+def render_onebutton(division: str):
+    """ワンボタン予測タブのメインUI"""
+    cache_key = f"onebutton_{division}"
+
+    # ── 主ボタン ──
+    st.markdown("""
+    <div style="text-align:center;padding:0.5rem 0;">
+      <div style="font-size:0.85rem;color:#64748b;">
+        ボタンを押すと最新データ取得 → ELO更新 → 全試合予測を自動実行します
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    run_btn = st.button(
+        "🚀 最新データ更新して予測する",
+        type="primary", use_container_width=True,
+        disabled=st.session_state.get("_onebutton_running", False),
+    )
+
+    if run_btn:
+        st.session_state["_onebutton_running"] = True
+        _run_onebutton_pipeline(division, cache_key)
+        st.session_state["_onebutton_running"] = False
+
+    # ── 結果表示 ──
+    if cache_key not in st.session_state:
+        st.markdown("""
+        <div style="text-align:center;padding:3rem 0;color:#374151;">
+          <div style="font-size:3rem;">🚀</div>
+          <div style="margin-top:0.8rem;font-size:0.95rem;color:#64748b;">
+            上のボタンを押すと<br>最新データの取得から全試合予測まで自動実行されます
+          </div>
+        </div>""", unsafe_allow_html=True)
+        return
+
+    result = st.session_state[cache_key]
+    _render_onebutton_results(result, division)
+
+
+def _run_onebutton_pipeline(division: str, cache_key: str):
+    """ワンボタン予測パイプライン: データ取得→予測→保存"""
+    from datetime import datetime as _dt
+
+    progress = st.progress(0.0, text="準備中...")
+    fetch_log = []
+    total_steps = 6
+
+    # Step 1: 試合スケジュール
+    r = _fetch_step("試合スケジュール取得", lambda: cached_matches(division), progress, 1, total_steps)
+    fetch_log.append(r)
+    matches = r["data"] if r["success"] else []
+
+    # Step 2: 順位表
+    r = _fetch_step("順位表取得", lambda: cached_standings(division), progress, 2, total_steps)
+    fetch_log.append(r)
+    standings = r["data"] if r["success"] else pd.DataFrame()
+
+    # Step 3: xG / カード / 過去結果
+    r = _fetch_step("詳細データ取得", lambda: {
+        "xg": cached_fbref_xg(division),
+        "cards": cached_discipline(division),
+        "past": cached_past_results(division),
+        "elo_ratings": cached_elo_ratings(division),
+    }, progress, 3, total_steps)
+    fetch_log.append(r)
+    detail = r["data"] if r["success"] else {"xg": {}, "cards": {}, "past": [], "elo_ratings": {}}
+
+    if not matches:
+        progress.empty()
+        st.warning("試合スケジュールが取得できませんでした")
+        return
+
+    # Step 4-5: 全試合予測
+    progress.progress(4 / total_steps, text=f"全{len(matches)}試合を予測中...")
+
+    def _row(team: str) -> dict:
+        if isinstance(standings, pd.DataFrame) and not standings.empty:
+            r = standings[standings["チーム"] == team]
+            return r.iloc[0].to_dict() if not r.empty else {}
+        return {}
+
+    xg_data = detail.get("xg", {})
+    cards_data = detail.get("cards", {})
+    past = detail.get("past", [])
+
+    preds = []
+    for i, match in enumerate(matches):
+        home, away = match["home"], match["away"]
+        progress.progress((4 + (i / len(matches))) / total_steps,
+                          text=f"予測中 {i+1}/{len(matches)}: {home} vs {away}")
+        try:
+            home_stats = _row(home)
+            away_stats = _row(away)
+            home_form = cached_form(home)
+            away_form = cached_form(away)
+            h2h = cached_h2h(home, away)
+            home_inj = get_injury_news(home)
+            away_inj = get_injury_news(away)
+            home_venue = get_venue_info(home, match.get("venue"))
+            away_venue = get_venue_info(away)
+            weather = cached_weather(home_venue["lat"], home_venue["lon"], match["date"])
+            home_xg = xg_data.get(home, {})
+            away_xg = xg_data.get(away, {})
+            home_cards = cards_data.get(home, {})
+            away_cards = cards_data.get(away, {})
+            home_days = calc_match_interval(home, match["date"], past)
+            away_days = calc_match_interval(away, match["date"], past)
+            elo_h, elo_a = get_elo_scores(division, home, away)
+
+            contributions = calculate_parameter_contributions(
+                home, away, home_stats, away_stats, home_form, away_form,
+                h2h, weather, home_inj, away_inj, home_venue, away_venue,
+                home_xg=home_xg, away_xg=away_xg,
+                home_cards=home_cards, away_cards=away_cards,
+                home_days=home_days, away_days=away_days,
+                elo_home_score=elo_h, elo_away_score=elo_a,
+            )
+            prediction = predict_with_gemini(
+                home, away, contributions,
+                home_stats, away_stats,
+                home_form, away_form, h2h, weather,
+                home_xg=home_xg, away_xg=away_xg,
+                home_days=home_days, away_days=away_days,
+                home_cards=home_cards, away_cards=away_cards,
+                home_injuries=home_inj, away_injuries=away_inj,
+            )
+            closeness = contributions.get("closeness", 0.5)
+            cls = _classify_prediction(prediction, closeness)
+            preds.append({
+                "match": match, "prediction": prediction,
+                "home_form": home_form, "away_form": away_form,
+                "classification": cls,
+            })
+            # 予測履歴に自動保存
+            store_save(division, match, prediction)
+        except Exception as exc:
+            preds.append({"match": match, "error": str(exc),
+                          "classification": {"confidence_level": "low", "draw_alert": False}})
+
+    # Step 6: 完了
+    progress.progress(1.0, text="完了!")
+    progress.empty()
+
+    # セッションに保存
+    skipped = [f["label"] for f in fetch_log if not f["success"]]
+    st.session_state[cache_key] = {
+        "preds": preds,
+        "standings": standings,
+        "fetched_at": _dt.now().isoformat(),
+        "skipped": skipped,
+        "n_matches": len(matches),
+    }
+    st.rerun()
+
+
+def _render_onebutton_results(result: dict, division: str):
+    """ワンボタン予測結果の表示"""
+    preds = result["preds"]
+    standings = result.get("standings", pd.DataFrame())
+    fetched_at = result.get("fetched_at", "?")
+    skipped = result.get("skipped", [])
+
+    # ── 鮮度パネル ──
+    skip_badges = ""
+    for s in skipped:
+        skip_badges += (
+            f'<span style="font-size:0.72rem;padding:3px 10px;background:#fef2f2;'
+            f'border:1px solid #fecaca;border-radius:999px;color:#dc2626;">Skip: {s}</span>'
+        )
+    time_display = fetched_at[:16].replace("T", " ") if len(fetched_at) >= 16 else fetched_at
+    st.markdown(f"""
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.8rem;">
+      <span style="font-size:0.72rem;padding:3px 10px;background:#f0fdf4;border:1px solid #bbf7d0;
+                   border-radius:999px;color:#15803d;">
+        更新: {time_display}
+      </span>
+      <span style="font-size:0.72rem;padding:3px 10px;background:#eff6ff;border:1px solid #bfdbfe;
+                   border-radius:999px;color:#1d4ed8;">
+        {result['n_matches']}試合
+      </span>
+      {skip_badges}
+    </div>""", unsafe_allow_html=True)
+
+    # ── サマリーカウント ──
+    valid = [p for p in preds if "error" not in p]
+    n_high = sum(1 for p in valid if p["classification"]["confidence_level"] == "high")
+    n_mid = sum(1 for p in valid if p["classification"]["confidence_level"] == "medium")
+    n_low = sum(1 for p in valid if p["classification"]["confidence_level"] == "low")
+    n_draw = sum(1 for p in valid if p["classification"]["draw_alert"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("高確信", f"{n_high}試合", help="max_prob >= 50%")
+    c2.metric("中確信", f"{n_mid}試合", help="max_prob 40-50%")
+    c3.metric("低確信", f"{n_low}試合", help="max_prob < 40%")
+    c4.metric("Draw警戒", f"{n_draw}試合", help="draw >= 25% かつ closeness >= 0.5")
+
+    # ── フィルタ ──
+    filter_opt = st.radio(
+        "フィルタ", ["全件", "高確信", "Draw警戒", "低確信"],
+        horizontal=True, label_visibility="collapsed",
+    )
+    if filter_opt == "高確信":
+        preds_f = [p for p in preds if p.get("classification", {}).get("confidence_level") == "high"]
+    elif filter_opt == "Draw警戒":
+        preds_f = [p for p in preds if p.get("classification", {}).get("draw_alert")]
+    elif filter_opt == "低確信":
+        preds_f = [p for p in preds if p.get("classification", {}).get("confidence_level") == "low"]
+    else:
+        preds_f = preds
+
+    if not preds_f:
+        st.info("該当する試合がありません")
+        return
+
+    # ── カード表示 ──
+    for i in range(0, len(preds_f), 2):
+        cols = st.columns(2)
+        for j, col in enumerate(cols):
+            if i + j < len(preds_f):
+                with col:
+                    _render_enhanced_card(preds_f[i + j], standings)
+
+
+def _render_enhanced_card(data: dict, standings: pd.DataFrame):
+    """確信度/draw警戒バッジ付きの強化版予測カード"""
+    match = data["match"]
+    home, away = match["home"], match["away"]
+
+    if "error" in data:
+        st.markdown(f"""
+        <div class="card">
+          <div style="color:#f87171;font-size:0.8rem;">⚠ {home} vs {away} — 予測エラー</div>
+          <div style="color:#64748b;font-size:0.72rem;">{data['error'][:80]}</div>
+        </div>""", unsafe_allow_html=True)
+        return
+
+    pred = data["prediction"]
+    cls = data.get("classification", {})
+    h_pct = int(pred.get("home_win_prob", 40))
+    d_pct = int(pred.get("draw_prob", 25))
+    a_pct = int(pred.get("away_win_prob", 35))
+    score = pred.get("predicted_score", "?-?")
+
+    # 確信度バッジ
+    cl = cls.get("confidence_level", "medium")
+    cl_style = {
+        "high": ("background:#dcfce7;color:#15803d;border-color:#86efac;", "高確信"),
+        "medium": ("background:#fef9c3;color:#a16207;border-color:#fde047;", "中確信"),
+        "low": ("background:#fee2e2;color:#dc2626;border-color:#fca5a5;", "低確信"),
+    }.get(cl, ("", "?"))
+
+    # draw警戒バッジ
+    draw_badge = ""
+    if cls.get("draw_alert"):
+        draw_badge = ('<span style="font-size:0.68rem;padding:2px 8px;margin-left:4px;'
+                      'background:#fef3c7;color:#92400e;border-radius:999px;'
+                      'border:1px solid #fbbf24;">Draw警戒</span>')
+
+    # 勝者ハイライト
+    if h_pct >= a_pct and h_pct >= d_pct:
+        winner_icon = "🏠"
+        home_w, away_w = "font-weight:900;color:#2563eb;", "color:#64748b;"
+    elif a_pct > h_pct and a_pct >= d_pct:
+        winner_icon = "✈"
+        home_w, away_w = "color:#64748b;", "font-weight:900;color:#dc2626;"
+    else:
+        winner_icon = "🤝"
+        home_w, away_w = "color:#64748b;", "color:#64748b;"
+
+    # 順位
+    def _rank(team):
+        if isinstance(standings, pd.DataFrame) and not standings.empty:
+            r = standings[standings["チーム"] == team]
+            return f"({r.iloc[0]['順位']}位)" if not r.empty else ""
+        return ""
+
+    hf_html = form_html(data.get("home_form", []))
+    af_html = form_html(data.get("away_form", []))
+
+    # Geminiコメント（折りたたみ）
+    reasoning = pred.get("reasoning", "")
+    reasoning_html = ""
+    if reasoning:
+        short = reasoning[:60] + "..." if len(reasoning) > 60 else reasoning
+        reasoning_html = (
+            f'<details style="margin-top:0.4rem;">'
+            f'<summary style="font-size:0.68rem;color:#64748b;cursor:pointer;">AI分析を見る</summary>'
+            f'<div style="font-size:0.68rem;color:#374151;margin-top:0.3rem;line-height:1.5;">{reasoning}</div>'
+            f'</details>'
+        )
+
+    st.markdown(f"""
+    <div class="card" style="margin-bottom:0.8rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+        <span style="font-size:0.7rem;color:#4b5563;">
+          {match['date']} {match.get('time','?')} | {match.get('venue','?')}
+        </span>
+        <span>
+          <span style="font-size:0.68rem;padding:2px 8px;border-radius:999px;
+                       border:1px solid;{cl_style[0]}">{cl_style[1]}</span>
+          {draw_badge}
+        </span>
+      </div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.6rem;">
+        <div style="text-align:left;flex:1;">
+          <div style="font-size:1rem;{home_w}">🏠 {home}</div>
+          <div style="font-size:0.65rem;color:#4b5563;">{_rank(home)} {hf_html}</div>
+        </div>
+        <div style="text-align:center;padding:0 0.8rem;">
+          <div style="font-size:1.1rem;font-weight:900;color:#0f172a;">{winner_icon} {score}</div>
+        </div>
+        <div style="text-align:right;flex:1;">
+          <div style="font-size:1rem;{away_w}">{away} ✈</div>
+          <div style="font-size:0.65rem;color:#4b5563;">{_rank(away)} {af_html}</div>
+        </div>
+      </div>
+
+      <div style="border-radius:8px;overflow:hidden;display:flex;height:26px;margin-bottom:4px;">
+        <div style="width:{h_pct}%;background:#3b82f6;display:flex;align-items:center;
+                    justify-content:center;font-size:0.8rem;font-weight:700;color:white;">
+          {h_pct}%
+        </div>
+        <div style="width:{d_pct}%;background:#f59e0b;display:flex;align-items:center;
+                    justify-content:center;font-size:0.8rem;font-weight:700;color:white;">
+          {d_pct}%
+        </div>
+        <div style="width:{a_pct}%;background:#ef4444;display:flex;align-items:center;
+                    justify-content:center;font-size:0.8rem;font-weight:700;color:white;">
+          {a_pct}%
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">
+        <span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span>
+      </div>
+      {reasoning_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # ─── 全試合予測カード ─────────────────────────────────────
 
 def _render_match_card(data: dict, standings: pd.DataFrame):
@@ -1896,9 +2264,12 @@ def main():
 
     division, match = sidebar()
 
-    tab_pred, tab_all, tab_hist, tab_stand, tab_about = st.tabs(
-        ["🔮 個別予測", "🗓️ 全試合予測", "📈 成績記録", "📊 順位表", "ℹ️ 使い方"]
+    tab_one, tab_pred, tab_all, tab_hist, tab_stand, tab_about = st.tabs(
+        ["🚀 ワンボタン予測", "🔮 個別予測", "🗓️ 全試合予測", "📈 成績記録", "📊 順位表", "ℹ️ 使い方"]
     )
+
+    with tab_one:
+        render_onebutton(division)
 
     with tab_pred:
         if match is None:
