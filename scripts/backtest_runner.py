@@ -181,7 +181,7 @@ def predict_current_model(
     h_def, a_def = score_defense_rate(h_stats, a_stats)
     h_f = score_recent_form(h_form[-form_n:])
     a_f = score_recent_form(a_form[-form_n:])
-    h_ha = score_home_advantage()
+    h_ha = score_home_advantage(home)
     a_ha = 1.0 - h_ha
     h_cap, a_cap = score_capital_power(home, away)
 
@@ -262,7 +262,7 @@ def predict_3logit(
     h_def, a_def = score_defense_rate(h_stats, a_stats)
     h_f = score_recent_form(h_form[-form_n:])
     a_f = score_recent_form(a_form[-form_n:])
-    h_ha = score_home_advantage()
+    h_ha = score_home_advantage(home)
     a_ha = 1.0 - h_ha
     h_cap, a_cap = score_capital_power(home, away)
 
@@ -333,7 +333,7 @@ def predict_integrated(
 
     contributions = calculate_parameter_contributions(
         home, away, h_stats, a_stats, h_form, a_form,
-        {}, {},  # h2h, weather (minimal)
+        {}, {},  # h2h skipped in backtest (HTTP too slow)
         [], [],  # injuries
         h_venue, a_venue,
         elo_home_score=elo_h, elo_away_score=elo_a,

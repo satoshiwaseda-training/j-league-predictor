@@ -101,6 +101,45 @@ _TEAM_CAPITAL_SCORES: dict[str, float] = {
 }
 _DEFAULT_CAPITAL_SCORE = 0.45  # データなしチームのデフォルト値
 
+# ─── チーム別ホームアドバンテージ (2024-2025実績) ─────────
+# score = ホーム勝率 + ホーム引分率 * 0.5 (0.0〜1.0)
+# データ: data.j-league.or.jp 2024+2025 計760試合
+_TEAM_HOME_ADVANTAGE: dict[str, float] = {
+    "鹿島アントラーズ":         0.776,
+    "ガンバ大阪":               0.671,
+    "サンフレッチェ広島":       0.671,
+    "浦和レッズ":               0.658,
+    "ヴィッセル神戸":           0.645,
+    "柏レイソル":               0.605,
+    "セレッソ大阪":             0.579,
+    "川崎フロンターレ":         0.579,
+    "FC町田ゼルビア":           0.566,
+    "名古屋グランパス":         0.526,
+    "FC東京":                   0.526,
+    "アビスパ福岡":             0.526,
+    "東京ヴェルディ":           0.513,
+    "京都サンガF.C.":           0.513,
+    "清水エスパルス":           0.500,
+    "ファジアーノ岡山":         0.474,
+    "横浜F・マリノス":          0.474,
+    "北海道コンサドーレ札幌":   0.447,
+    "横浜FC":                   0.421,
+    "ジュビロ磐田":             0.421,
+    "湘南ベルマーレ":           0.395,
+    "サガン鳥栖":               0.395,
+    "アルビレックス新潟":       0.355,
+}
+_DEFAULT_HOME_ADVANTAGE = 0.520  # J1平均
+
+# ─── 昇格組フラグ (2026シーズン) ─────────────────────────
+# J2からの昇格チームはELO蓄積が浅い＋適応期間があるためペナルティ
+_PROMOTED_2026: set[str] = {
+    "ジェフユナイテッド千葉",
+    "V・ファーレン長崎",
+    "水戸ホーリーホック",  # J2J3百年構想リーグから
+}
+_PROMOTED_ELO_PENALTY = 0.05  # ELOスコアから減算
+
 # ─── 移動距離・疲労 ────────────────────────────────────────
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -433,13 +472,14 @@ def score_recent_form(form: list[str] | str) -> float:
     return round(sum(values.get(r, 0.5) * w for r, w in zip(form, weights)) / total_w, 3)
 
 
-def score_home_advantage() -> float:
+def score_home_advantage(home_team: str = "") -> float:
     """
-    ホームアドバンテージ: 固定スコア
-    根拠: Jリーグ統計でホーム勝率≈48%、アウェー勝率≈30%
-    差異を 0.15 スコアとして換算
+    チーム別ホームアドバンテージ (2024-2025実績ベース)
+    home_team が空の場合はJ1平均を返す (後方互換)
     """
-    return 0.62  # ホームチームの「ホーム強度」= 62%
+    if not home_team:
+        return _DEFAULT_HOME_ADVANTAGE
+    return _TEAM_HOME_ADVANTAGE.get(home_team, _DEFAULT_HOME_ADVANTAGE)
 
 
 def score_h2h(h2h: dict, is_home: bool) -> float:
@@ -645,7 +685,7 @@ def calculate_parameter_contributions(
     h_xg_s, a_xg_s     = score_xg_differential(home_xg or {}, away_xg or {})
     h_xg_for, a_xg_for      = score_xg_for(home_xg or {}, away_xg or {})
     h_xg_against, a_xg_against = score_xg_against(home_xg or {}, away_xg or {})
-    h_home              = score_home_advantage()
+    h_home              = score_home_advantage(home_team)
     a_away              = 1.0 - h_home
     h_cap, a_cap        = score_capital_power(home_team, away_team)
     h_h2h               = score_h2h(h2h, is_home=True)
@@ -705,8 +745,12 @@ def calculate_parameter_contributions(
         ("player_availability_impact",  h_pai,   a_pai),
         ("match_trend",                 h_trend, a_trend),
         ("referee_tendency",            h_ref,   a_ref),
-        ("elo",                         elo_home_score if elo_home_score is not None else 0.5,
-                                        elo_away_score if elo_away_score is not None else 0.5),
+        ("elo",
+            max(0.0, (elo_home_score if elo_home_score is not None else 0.5)
+                - (_PROMOTED_ELO_PENALTY if home_team in _PROMOTED_2026 else 0.0)),
+            max(0.0, (elo_away_score if elo_away_score is not None else 0.5)
+                - (_PROMOTED_ELO_PENALTY if away_team in _PROMOTED_2026 else 0.0)),
+        ),
     ]:
         adv = round(h_score - a_score, 3)
         w = MODEL_WEIGHTS.get(name, 0.0)

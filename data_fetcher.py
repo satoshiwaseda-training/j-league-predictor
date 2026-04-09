@@ -1231,37 +1231,60 @@ def get_fbref_xg_stats(division: str = "j1") -> dict[str, dict]:
 
 def get_head_to_head(home: str, away: str, n: int = 10) -> dict:
     """
-    2チームの過去対戦成績。
-    返り値: {"home_wins": int, "draws": int, "away_wins": int, "recent": [...]}
+    2チームの過去対戦成績 (data.j-league.or.jp 実データ版)。
+    2024-2025シーズンの実際の対戦結果を使用。
+    データなしの場合は中立値を返す。
+    返り値: {"home_wins": int, "draws": int, "away_wins": int, "total": int, "recent": [...]}
     """
-    import random, hashlib
-    seed = int(hashlib.md5(f"{home}{away}".encode()).hexdigest(), 16) % 2**32
-    rng = random.Random(seed)
+    try:
+        matches = []
+        for year in [2024, 2025]:
+            for m in get_historical_results(year):
+                if (m["home"] == home and m["away"] == away) or \
+                   (m["home"] == away and m["away"] == home):
+                    matches.append(m)
 
-    home_wins = rng.randint(1, n - 2)
-    draws = rng.randint(1, n - home_wins - 1)
-    away_wins = n - home_wins - draws
+        if not matches:
+            # 対戦実績なし → 中立値
+            return {"home_wins": 1, "draws": 1, "away_wins": 1, "total": 3, "recent": []}
 
-    recent = []
-    for _ in range(min(5, n)):
-        winner = rng.choices([home, "draw", away], weights=[home_wins, draws, away_wins])[0]
-        goals_h = rng.randint(0, 3)
-        goals_a = rng.randint(0, 3)
-        if winner == home:
-            goals_h = max(goals_h, goals_a + 1)
-        elif winner == away:
-            goals_a = max(goals_a, goals_h + 1)
-        else:
-            goals_h = goals_a
-        recent.append({"score": f"{goals_h}-{goals_a}", "winner": winner})
+        # homeチーム視点で集計
+        home_wins, draws, away_wins = 0, 0, 0
+        recent = []
+        for m in matches[-n:]:
+            score = m.get("score", "0-0")
+            if m["home"] == home:
+                if m["winner"] == "home":
+                    home_wins += 1
+                elif m["winner"] == "draw":
+                    draws += 1
+                else:
+                    away_wins += 1
+                recent.append({"score": score, "winner": m["winner"]})
+            else:
+                # home/awayが逆の試合
+                hs, asc = score.split("-")
+                rev_score = f"{asc}-{hs}"
+                if m["winner"] == "home":
+                    away_wins += 1
+                    recent.append({"score": rev_score, "winner": "away"})
+                elif m["winner"] == "draw":
+                    draws += 1
+                    recent.append({"score": rev_score, "winner": "draw"})
+                else:
+                    home_wins += 1
+                    recent.append({"score": rev_score, "winner": "home"})
 
-    return {
-        "home_wins": home_wins,
-        "draws": draws,
-        "away_wins": away_wins,
-        "total": n,
-        "recent": recent,
-    }
+        return {
+            "home_wins": home_wins,
+            "draws": draws,
+            "away_wins": away_wins,
+            "total": len(matches[-n:]),
+            "recent": recent[-5:],
+        }
+    except Exception as exc:
+        logger.warning("H2H fetch failed: %s", exc)
+        return {"home_wins": 1, "draws": 1, "away_wins": 1, "total": 3, "recent": []}
 
 
 # ─────────────────────────────────────────────
