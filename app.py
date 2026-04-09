@@ -1206,6 +1206,34 @@ def _render_onebutton_results(result: dict, division: str):
     c3.metric("低確信", f"{n_low}試合", help="max_prob < 40%")
     c4.metric("Draw警戒", f"{n_draw}試合", help="draw >= 25% かつ closeness >= 0.5")
 
+    # ── 品質ランク凡例 (常設) ──
+    st.markdown("""
+    <div style="display:flex;gap:0.6rem;flex-wrap:wrap;align-items:center;
+                padding:0.5rem 0.8rem;margin:0.4rem 0 0.6rem;
+                background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
+      <span style="font-size:0.7rem;color:#475569;font-weight:600;">データ品質:</span>
+      <span style="font-size:0.65rem;padding:1px 6px;background:#dcfce7;color:#15803d;
+                   border-radius:4px;border:1px solid #86efac;font-weight:700;">A</span>
+      <span style="font-size:0.63rem;color:#64748b;">全ソース</span>
+      <span style="font-size:0.65rem;padding:1px 6px;background:#dbeafe;color:#2563eb;
+                   border-radius:4px;border:1px solid #93c5fd;font-weight:700;">B</span>
+      <span style="font-size:0.63rem;color:#64748b;">高品質</span>
+      <span style="font-size:0.65rem;padding:1px 6px;background:#fef9c3;color:#a16207;
+                   border-radius:4px;border:1px solid #fde047;font-weight:700;">C</span>
+      <span style="font-size:0.63rem;color:#64748b;">公式中心</span>
+      <span style="font-size:0.65rem;padding:1px 6px;background:#fee2e2;color:#dc2626;
+                   border-radius:4px;border:1px solid #fca5a5;font-weight:700;">D</span>
+      <span style="font-size:0.63rem;color:#64748b;">データ不足</span>
+      <span style="font-size:0.5rem;color:#94a3b8;margin-left:0.3rem;">|</span>
+      <span style="font-size:0.7rem;color:#475569;font-weight:600;">確信度:</span>
+      <span style="font-size:0.63rem;padding:2px 7px;background:#dcfce7;color:#15803d;
+                   border-radius:999px;border:1px solid #86efac;">高確信</span>
+      <span style="font-size:0.63rem;padding:2px 7px;background:#fef9c3;color:#a16207;
+                   border-radius:999px;border:1px solid #fde047;">中確信</span>
+      <span style="font-size:0.63rem;padding:2px 7px;background:#fee2e2;color:#dc2626;
+                   border-radius:999px;border:1px solid #fca5a5;">低確信</span>
+    </div>""", unsafe_allow_html=True)
+
     # ── フィルタ ──
     filter_opt = st.radio(
         "フィルタ", ["全件", "高確信", "Draw警戒", "低確信"],
@@ -1312,10 +1340,26 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
          "規律": "🟨", "Gemini": "🤖"}.get(s, s) for s in dq_sources
     )
 
-    # Geminiコメント + データ品質明細（折りたたみ）
+    # Dランク時の警告バナー
+    d_rank_warning = ""
+    if dq_rank == "D":
+        d_rank_warning = (
+            '<div style="margin-top:0.4rem;padding:0.35rem 0.6rem;background:#fef2f2;'
+            'border:1px solid #fecaca;border-radius:6px;font-size:0.68rem;color:#991b1b;">'
+            'データ不足のため参考度が低い予測です。'
+            '「🚀 最新データ更新して予測する」で再取得をお試しください。'
+            '</div>'
+        )
+    elif dq_rank == "C":
+        d_rank_warning = (
+            '<div style="margin-top:0.4rem;padding:0.3rem 0.6rem;background:#fefce8;'
+            'border:1px solid #fef08a;border-radius:6px;font-size:0.66rem;color:#854d0e;">'
+            'xG・Gemini未使用の公式データ中心の簡略版予測です'
+            '</div>'
+        )
+
+    # データ品質明細 + AI分析（折りたたみ）
     reasoning = pred.get("reasoning", "")
-    details_html = ""
-    # データ品質行
     details_inner = (
         f'<div style="font-size:0.66rem;color:#64748b;margin-top:0.3rem;">'
         f'<b>利用データ:</b> {", ".join(dq_sources) if dq_sources else "なし"}<br>'
@@ -1328,6 +1372,7 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
             f'line-height:1.5;border-top:1px solid #e5e7eb;padding-top:0.3rem;">{reasoning}</div>'
         )
     details_html = (
+        f'{d_rank_warning}'
         f'<details style="margin-top:0.4rem;">'
         f'<summary style="font-size:0.68rem;color:#64748b;cursor:pointer;">'
         f'{source_icons} 詳細を見る</summary>'
