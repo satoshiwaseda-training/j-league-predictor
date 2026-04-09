@@ -378,7 +378,24 @@ def compute_data_quality(
             missing.append("順位表")
         if not has_results:
             missing.append("試合結果")
+        if not has_elo:
+            missing.append("ELO")
         note = f"未取得: {', '.join(missing)}"
+
+    # 全ランク共通: 不足データの詳細
+    missing_detail = []
+    if not has_standings:
+        missing_detail.append("順位表")
+    if not has_results:
+        missing_detail.append("試合結果")
+    if not has_elo:
+        missing_detail.append("ELO")
+    if not has_xg:
+        missing_detail.append("xG統計")
+    if not has_discipline:
+        missing_detail.append("規律統計")
+    if not gemini_used:
+        missing_detail.append("Gemini AI")
 
     return {
         "rank": rank,
@@ -386,6 +403,7 @@ def compute_data_quality(
         "color": color,
         "sources_used": sources,
         "note": note,
+        "missing": missing_detail,
         "gemini_used": gemini_used,
         "has_xg": has_xg,
         "has_elo": has_elo,

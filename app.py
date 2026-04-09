@@ -994,6 +994,60 @@ def _classify_prediction(pred: dict, closeness: float = 0.5) -> dict:
             "max_prob": mx, "closeness": closeness}
 
 
+def _render_spotlight(valid_preds: list[dict]):
+    """今日の注目試合セクション: 堅い/波乱/要注意の3分類"""
+    if not valid_preds:
+        return
+
+    solid, upset, caution = [], [], []
+    for p in valid_preds:
+        pred = p.get("prediction", {})
+        cls = p.get("classification", {})
+        mx = cls.get("max_prob", 0)
+        da = cls.get("draw_alert", False)
+        home = p["match"]["home"]
+        away = p["match"]["away"]
+        label = f"{home} vs {away}"
+        h = int(pred.get("home_win_prob", 40))
+        d = int(pred.get("draw_prob", 25))
+        a = int(pred.get("away_win_prob", 35))
+
+        if mx >= 50:
+            solid.append((label, h, d, a))
+        elif da:
+            caution.append((label, h, d, a))
+        elif abs(h - a) <= 8:
+            upset.append((label, h, d, a))
+
+    if not solid and not upset and not caution:
+        return
+
+    def _pill(items, emoji, title, bg, border, color):
+        if not items:
+            return ""
+        cards = ""
+        for name, h, d, a in items[:3]:
+            cards += (
+                f'<div style="font-size:0.7rem;padding:2px 0;">'
+                f'{name} <span style="color:#64748b;">({h}-{d}-{a})</span></div>'
+            )
+        return (
+            f'<div style="flex:1;min-width:160px;padding:0.5rem 0.7rem;'
+            f'background:{bg};border:1px solid {border};border-radius:8px;">'
+            f'<div style="font-size:0.75rem;font-weight:700;color:{color};margin-bottom:0.3rem;">'
+            f'{emoji} {title}</div>{cards}</div>'
+        )
+
+    html = (
+        '<div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin:0.5rem 0 0.6rem;">'
+        + _pill(solid, "🔒", "堅い試合", "#f0fdf4", "#bbf7d0", "#15803d")
+        + _pill(upset, "⚡", "波乱の可能性", "#fef2f2", "#fecaca", "#dc2626")
+        + _pill(caution, "⚠", "引分け要注意", "#fefce8", "#fef08a", "#a16207")
+        + '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _fetch_step(label: str, fn, progress_bar, step: int, total: int):
     """データ取得ステップを実行し結果を返す。失敗時はNone。"""
     progress_bar.progress(step / total, text=f"{label}...")
@@ -1129,11 +1183,23 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             cls = _classify_prediction(prediction, closeness)
             gemini_used = "gemini" in str(prediction.get("model", "")).lower()
             dq = compute_data_quality(pipeline, home_xg, away_xg, gemini_used)
+            # 統計モデル事前確率 → Gemini差分
+            stat_h, stat_d, stat_a = advantage_to_probs(
+                contributions["raw_home_advantage"], closeness)
+            gem_diff = None
+            if gemini_used:
+                gem_diff = {
+                    "home": int(prediction.get("home_win_prob", stat_h)) - stat_h,
+                    "draw": int(prediction.get("draw_prob", stat_d)) - stat_d,
+                    "away": int(prediction.get("away_win_prob", stat_a)) - stat_a,
+                }
             preds.append({
                 "match": match, "prediction": prediction,
                 "home_form": home_form, "away_form": away_form,
                 "classification": cls, "gemini_used": gemini_used,
                 "data_quality": dq,
+                "stat_prior": {"home": stat_h, "draw": stat_d, "away": stat_a},
+                "gemini_diff": gem_diff,
             })
             snapshots.append(build_feature_snapshot(
                 match, prediction, contributions, pipeline, gemini_used,
@@ -1200,11 +1266,23 @@ def _render_onebutton_results(result: dict, division: str):
     n_low = sum(1 for p in valid if p["classification"]["confidence_level"] == "low")
     n_draw = sum(1 for p in valid if p["classification"]["draw_alert"])
 
-    c1, c2, c3, c4 = st.columns(4)
+    # 直近予測精度 (prediction_store から)
+    past_preds = store_load_all()
+    past_stats = get_accuracy_stats(past_preds)
+    acc_text = ""
+    if past_stats.get("accuracy") is not None:
+        acc_pct = round(past_stats["accuracy"] * 100, 1)
+        acc_text = f"{acc_pct}% ({past_stats['correct']}/{past_stats['with_actual']})"
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("高確信", f"{n_high}試合", help="max_prob >= 50%")
     c2.metric("中確信", f"{n_mid}試合", help="max_prob 40-50%")
     c3.metric("低確信", f"{n_low}試合", help="max_prob < 40%")
     c4.metric("Draw警戒", f"{n_draw}試合", help="draw >= 25% かつ closeness >= 0.5")
+    c5.metric("直近正答率", acc_text or "--", help="成績記録タブで結果登録後に表示")
+
+    # ── 今日の注目試合 ──
+    _render_spotlight(valid)
 
     # ── 品質ランク凡例 (常設) ──
     st.markdown("""
@@ -1373,14 +1451,16 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
     }.get(dq_rank, "")
 
     # Dランク/Cランク時の警告バナー
+    dq_missing = dq.get("missing", [])
     d_rank_warning = ""
     if dq_rank == "D":
+        missing_text = "、".join(dq_missing) if dq_missing else "一部データ"
         d_rank_warning = (
-            '<div style="margin-top:0.4rem;padding:0.35rem 0.6rem;background:#fef2f2;'
-            'border:1px solid #fecaca;border-radius:6px;font-size:0.68rem;color:#991b1b;">'
-            'データ不足のため参考度が低い予測です。'
-            '上部の「🚀 最新データ更新して予測する」ボタンで再取得してください。'
-            '</div>'
+            f'<div style="margin-top:0.4rem;padding:0.35rem 0.6rem;background:#fef2f2;'
+            f'border:1px solid #fecaca;border-radius:6px;font-size:0.68rem;color:#991b1b;">'
+            f'<b>不足:</b> {missing_text}<br>'
+            f'参考度が低い予測です。上部の「🚀」ボタンで再取得をお試しください。'
+            f'</div>'
         )
     elif dq_rank == "C":
         d_rank_warning = (
@@ -1401,10 +1481,27 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
 
     # データ品質明細 + AI分析（折りたたみ）
     reasoning = pred.get("reasoning", "")
+    # Gemini補正の影響
+    gem_diff = data.get("gemini_diff")
+    stat_prior = data.get("stat_prior", {})
+    gemini_diff_html = ""
+    if gem_diff and gemini_used:
+        def _sign(v):
+            return f"+{v}" if v > 0 else str(v)
+        gemini_diff_html = (
+            f'<br><b>Gemini補正:</b> '
+            f'H {_sign(gem_diff["home"])}pp '
+            f'D {_sign(gem_diff["draw"])}pp '
+            f'A {_sign(gem_diff["away"])}pp '
+            f'<span style="color:#94a3b8;">'
+            f'(統計: {stat_prior.get("home","?")}%-{stat_prior.get("draw","?")}%-{stat_prior.get("away","?")}%)</span>'
+        )
+
     details_inner = (
         f'<div style="font-size:0.66rem;color:#64748b;margin-top:0.3rem;">'
         f'<b>利用データ:</b> {", ".join(dq_sources) if dq_sources else "なし"}<br>'
         f'<b>品質:</b> {dq_label} — {dq_note}'
+        f'{gemini_diff_html}'
         f'</div>'
     )
     if reasoning:
