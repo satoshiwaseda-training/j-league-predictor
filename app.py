@@ -1201,10 +1201,20 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             closeness = contributions.get("closeness", 0.5)
 
             # Primary model selection (hybrid_v9.1 or v7 fallback)
-            from scripts.predict_logic import PRIMARY_MODEL_VERSION, compute_hybrid_v9, compute_shadow_v8_1
-            if PRIMARY_MODEL_VERSION == "hybrid_v9.1":
+            # 動的import + getattr で存在しない場合でも安全にfallback
+            try:
+                import scripts.predict_logic as _pl
+                _primary_ver = getattr(_pl, "PRIMARY_MODEL_VERSION", "v7_refined")
+                _compute_hybrid = getattr(_pl, "compute_hybrid_v9", None)
+                _compute_shadow = getattr(_pl, "compute_shadow_v8_1", None)
+            except Exception:
+                _primary_ver = "v7_refined"
+                _compute_hybrid = None
+                _compute_shadow = None
+
+            if _primary_ver == "hybrid_v9.1" and _compute_hybrid is not None:
                 try:
-                    hybrid = compute_hybrid_v9(
+                    hybrid = _compute_hybrid(
                         home, away, home_stats, away_stats,
                         home_form, away_form,
                         v7_prediction=v7_prediction,
@@ -1255,22 +1265,38 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 match, prediction, contributions, pipeline, gemini_used,
             ))
             # Shadow v8.1 併走予測
-            try:
-                shadow_pred = compute_shadow_v8_1(
-                    home, away, home_stats, away_stats,
-                    home_form, away_form,
-                    elo_home_score=elo_h, elo_away_score=elo_a,
-                )
-            except Exception:
-                shadow_pred = None
+            shadow_pred = None
+            if _compute_shadow is not None:
+                try:
+                    shadow_pred = _compute_shadow(
+                        home, away, home_stats, away_stats,
+                        home_form, away_form,
+                        elo_home_score=elo_h, elo_away_score=elo_a,
+                    )
+                except Exception:
+                    shadow_pred = None
             # 保存: primary(hybrid), baseline(v7), shadow(v8.1)
-            store_save(
-                division, match, prediction,
-                shadow_prediction=shadow_pred,
-                baseline_prediction=v7_prediction,
-                model_version=primary_version,
-                baseline_model_version="v7_refined",
-            )
+            # store_save の新シグネチャに対応しないバージョンでも動くよう
+            # kwargs を段階的に渡してfallback
+            try:
+                store_save(
+                    division, match, prediction,
+                    shadow_prediction=shadow_pred,
+                    baseline_prediction=v7_prediction,
+                    model_version=primary_version,
+                    baseline_model_version="v7_refined",
+                )
+            except TypeError:
+                # 古いstore_save (baseline_prediction非対応) の場合
+                try:
+                    store_save(
+                        division, match, prediction,
+                        shadow_prediction=shadow_pred,
+                        model_version=primary_version,
+                    )
+                except TypeError:
+                    # 最古バージョン対応
+                    store_save(division, match, prediction)
         except Exception as exc:
             import traceback as _tb
             preds.append({
