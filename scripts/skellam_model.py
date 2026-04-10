@@ -26,6 +26,9 @@ MAX_GOALS = 8  # 列挙する最大得点 (0-8)
 # Dixon-Colesの低スコア補正 (draw の確率が過小評価される問題を緩和)
 RHO = -0.08  # 負の値で draw 0-0, 1-1 の確率をブースト
 
+# 推奨デフォルト (2024-2025 val/2026 holdout で最適バランス)
+DEFAULT_DRAW_BOOST = 0.06  # closeness-based draw boost
+
 
 def _poisson_pmf(k: int, lam: float) -> float:
     """ポアソン分布の確率質量関数"""
@@ -56,6 +59,10 @@ def predict_skellam(
     home_advantage: float = 0.25,
     league_avg: float = LEAGUE_AVG_GOALS,
     use_dc_correction: bool = True,
+    rho: float = RHO,
+    draw_boost: float = 0.0,
+    elo_home_score: float | None = None,
+    elo_away_score: float | None = None,
 ) -> dict[str, Any]:
     """
     Skellamモデルによる予測。
@@ -127,7 +134,7 @@ def predict_skellam(
             p_j = _poisson_pmf(j, lam_away)
             p_ij = p_i * p_j
             if use_dc_correction:
-                p_ij *= _dixon_coles_correction(i, j, lam_home, lam_away, RHO)
+                p_ij *= _dixon_coles_correction(i, j, lam_home, lam_away, rho)
             if i > j:
                 p_home_win += p_ij
             elif i == j:
@@ -146,6 +153,34 @@ def predict_skellam(
     p_home_win /= total
     p_draw /= total
     p_away_win /= total
+
+    # ── closeness-based draw boost ──
+    # λ差とELO差から接近度を計算し、接近試合でdraw確率を増加
+    if draw_boost > 0:
+        lam_diff = abs(lam_home - lam_away)
+        # λ差が0.4以下のとき最大boost、1.0以上でboost=0
+        lam_closeness = max(0.0, 1.0 - lam_diff / 1.0)
+        # ELO差も考慮 (あれば)
+        if elo_home_score is not None and elo_away_score is not None:
+            elo_closeness = max(0.0, 1.0 - abs(elo_home_score - elo_away_score) * 2)
+            closeness = (lam_closeness + elo_closeness) / 2
+        else:
+            closeness = lam_closeness
+
+        # 接近度 * draw_boost 分だけ draw確率をブースト
+        boost_amount = closeness * draw_boost
+        p_draw_new = min(0.50, p_draw + boost_amount)
+        delta = p_draw_new - p_draw
+        # home/awayから比例減算
+        if (p_home_win + p_away_win) > 0:
+            p_home_win -= delta * (p_home_win / (p_home_win + p_away_win))
+            p_away_win -= delta * (p_away_win / (p_home_win + p_away_win + 1e-9))
+        p_draw = p_draw_new
+        # 再正規化
+        total2 = p_home_win + p_draw + p_away_win
+        p_home_win /= total2
+        p_draw /= total2
+        p_away_win /= total2
 
     h_pct = round(p_home_win * 100)
     a_pct = round(p_away_win * 100)

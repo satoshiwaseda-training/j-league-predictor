@@ -104,8 +104,13 @@ def _run_predictor_with_weights(all_results, eval_season, model_weights, logit_p
     return res
 
 
-def _run_skellam_walk_forward(all_results: list[dict], eval_season: int,
-                                home_advantage: float = 0.25) -> dict:
+def _run_skellam_walk_forward(
+    all_results: list[dict], eval_season: int,
+    home_advantage: float = 0.25,
+    rho: float = -0.08,
+    draw_boost: float = 0.0,
+    use_elo: bool = False,
+) -> dict:
     """Skellam モデルの walk-forward 評価"""
     predictions = []
     for idx, match in enumerate(all_results):
@@ -127,7 +132,20 @@ def _run_skellam_walk_forward(all_results: list[dict], eval_season: int,
         h_stats = hs.to_stats_dict(ranks.get(home, 99))
         a_stats = as_.to_stats_dict(ranks.get(away, 99))
 
-        sp = predict_skellam(h_stats, a_stats, home_advantage=home_advantage)
+        # ELO取得 (オプション)
+        elo_h = elo_a = None
+        if use_elo:
+            elo = build_elo(all_results, idx, k=32.0, home_bonus=50.0)
+            elo_h, elo_a = elo.score_pair(home, away)
+
+        sp = predict_skellam(
+            h_stats, a_stats,
+            home_advantage=home_advantage,
+            rho=rho,
+            draw_boost=draw_boost,
+            elo_home_score=elo_h,
+            elo_away_score=elo_a,
+        )
         predictions.append({
             "idx": idx,
             "date": match.get("date", ""),
@@ -145,7 +163,6 @@ def _run_skellam_walk_forward(all_results: list[dict], eval_season: int,
     if not predictions:
         return {"predictions": [], "metrics": {}}
 
-    # 指標算出
     probs, y_idx = predictions_to_arrays(predictions)
     return {"predictions": predictions, "metrics": _metrics_from_probs(probs, y_idx)}
 
@@ -228,11 +245,29 @@ def run_full_comparison() -> dict:
             m = {}
         models.setdefault("v8.1+iso", {})[season] = {"metrics": m, "predictions": base_res["predictions"]}
 
-    # --- xG-Skellam ---
+    # --- xG-Skellam (baseline, rho=-0.08) ---
     print("[6/7] xG-Skellam...")
     for season in [2025, 2026]:
         res = _run_skellam_walk_forward(all_results, season)
         models.setdefault("skellam", {})[season] = res
+
+    # --- Skellam+ with draw boost ---
+    print("      Skellam+draw_boost...")
+    for season in [2025, 2026]:
+        res = _run_skellam_walk_forward(
+            all_results, season,
+            draw_boost=0.10, use_elo=True,
+        )
+        models.setdefault("skellam+boost", {})[season] = res
+
+    # --- Skellam with stronger DC correction ---
+    print("      Skellam+DC強化...")
+    for season in [2025, 2026]:
+        res = _run_skellam_walk_forward(
+            all_results, season,
+            rho=-0.15, draw_boost=0.08, use_elo=True,
+        )
+        models.setdefault("skellam+dc", {})[season] = res
 
     # --- elo_only ---
     print("[7/7] elo_only...")
@@ -243,6 +278,38 @@ def run_full_comparison() -> dict:
         if len(probs):
             res["metrics"] = _metrics_from_probs(probs, y_idx)
         models.setdefault("elo_only", {})[season] = res
+
+    # --- Selection Ensemble: draw警戒時はv7, それ以外はSkellam+boost ---
+    print("\n[selection] draw警戒→v7, それ以外→Skellam+...")
+    for season in [2025, 2026]:
+        v7_preds = models["v7"][season].get("predictions", [])
+        sk_preds = models["skellam+boost"][season].get("predictions", [])
+        if not v7_preds or not sk_preds:
+            continue
+        v7_map = {p["idx"]: p for p in v7_preds}
+        sk_map = {p["idx"]: p for p in sk_preds}
+        common = sorted(set(v7_map) & set(sk_map))
+
+        sel_probs = []
+        actuals = []
+        for idx in common:
+            v7p = v7_map[idx]
+            # draw警戒判定: draw_prob>=25% かつ closeness高い (home/away接近)
+            draw_alert = v7p["prob_draw"] >= 0.25 and abs(v7p["prob_home"] - v7p["prob_away"]) < 0.10
+            if draw_alert:
+                # v7採用
+                probs = [v7p["prob_away"], v7p["prob_draw"], v7p["prob_home"]]
+            else:
+                # Skellam+採用
+                skp = sk_map[idx]
+                probs = [skp["prob_away"], skp["prob_draw"], skp["prob_home"]]
+            sel_probs.append(probs)
+            actuals.append({"away": 0, "draw": 1, "home": 2}[v7p["actual"]])
+
+        sel_arr = np.array(sel_probs)
+        y_arr = np.array(actuals)
+        m = _metrics_from_probs(sel_arr, y_arr)
+        models.setdefault("selection", {})[season] = {"metrics": m}
 
     # --- 軽量アンサンブル: v7 + v8.1+temp + skellam の平均 ---
     print("\n[ensemble] v7 + v8.1+temp + skellam 平均...")
