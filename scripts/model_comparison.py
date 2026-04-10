@@ -30,7 +30,7 @@ from data_fetcher import get_multi_season_results
 from scripts.backtest_runner import (
     run_walk_forward, rebuild_states, compute_ranks, build_elo, compute_metrics
 )
-from scripts.skellam_model import predict_skellam
+from scripts.skellam_model import predict_skellam, predict_skellam_dynamic, compute_dynamic_draw_boost
 from scripts.calibration import (
     TemperatureScaler, IsotonicCalibrator, predictions_to_arrays, compute_ece
 )
@@ -167,6 +167,50 @@ def _run_skellam_walk_forward(
     return {"predictions": predictions, "metrics": _metrics_from_probs(probs, y_idx)}
 
 
+def _run_skellam_dynamic_walk_forward(all_results: list[dict], eval_season: int) -> dict:
+    """動的boost付きSkellamの walk-forward 評価"""
+    predictions = []
+    for idx, match in enumerate(all_results):
+        if match.get("season") != eval_season:
+            continue
+        actual = match.get("winner")
+        if not actual:
+            continue
+        home, away = match["home"], match["away"]
+        states = rebuild_states(all_results, idx)
+        hs = states.get(home)
+        as_ = states.get(away)
+        if not hs or not as_:
+            continue
+        ranks = compute_ranks(states)
+        h_stats = hs.to_stats_dict(ranks.get(home, 99))
+        a_stats = as_.to_stats_dict(ranks.get(away, 99))
+
+        elo = build_elo(all_results, idx, k=32.0, home_bonus=50.0)
+        elo_h, elo_a = elo.score_pair(home, away)
+
+        sp = predict_skellam_dynamic(
+            h_stats, a_stats,
+            elo_home_score=elo_h, elo_away_score=elo_a,
+        )
+        predictions.append({
+            "idx": idx, "date": match.get("date", ""),
+            "section": match.get("section", 0),
+            "home": home, "away": away, "actual": actual,
+            "prob_home": sp["home_win_prob"] / 100,
+            "prob_draw": sp["draw_prob"] / 100,
+            "prob_away": sp["away_win_prob"] / 100,
+            "predicted": max([("home", sp["home_win_prob"]), ("draw", sp["draw_prob"]),
+                              ("away", sp["away_win_prob"])], key=lambda x: x[1])[0],
+            "dynamic_boost": sp.get("dynamic_boost", 0.0),
+        })
+
+    if not predictions:
+        return {"predictions": [], "metrics": {}}
+    probs, y_idx = predictions_to_arrays(predictions)
+    return {"predictions": predictions, "metrics": _metrics_from_probs(probs, y_idx)}
+
+
 def _preds_to_probs_labels(res: dict) -> tuple[np.ndarray, np.ndarray]:
     preds = res.get("predictions", [])
     if not preds:
@@ -269,6 +313,12 @@ def run_full_comparison() -> dict:
         )
         models.setdefault("skellam+dc", {})[season] = res
 
+    # --- Skellam dynamic (動的boost) ---
+    print("      Skellam dynamic...")
+    for season in [2025, 2026]:
+        res = _run_skellam_dynamic_walk_forward(all_results, season)
+        models.setdefault("skellam_dyn", {})[season] = res
+
     # --- elo_only ---
     print("[7/7] elo_only...")
     for season in [2025, 2026]:
@@ -278,6 +328,57 @@ def run_full_comparison() -> dict:
         if len(probs):
             res["metrics"] = _metrics_from_probs(probs, y_idx)
         models.setdefault("elo_only", {})[season] = res
+
+    # --- Hybrid v9: Model selection with dynamic boost Skellam ---
+    # ルール:
+    #   - v7のdraw警戒時 → v7採用
+    #   - Skellam dynamicが高確信 (max_prob >= 50%) → Skellam採用
+    #   - それ以外 → v7とSkellamの重み付き平均 (0.5/0.5)
+    print("\n[hybrid v9] draw警戒→v7, 高確信→Skellam_dyn, else→weighted")
+    for season in [2025, 2026]:
+        v7_preds = models["v7"][season].get("predictions", [])
+        sk_preds = models["skellam_dyn"][season].get("predictions", [])
+        if not v7_preds or not sk_preds:
+            continue
+        v7_map = {p["idx"]: p for p in v7_preds}
+        sk_map = {p["idx"]: p for p in sk_preds}
+        common = sorted(set(v7_map) & set(sk_map))
+
+        hyb_probs = []
+        actuals = []
+        selection_log = {"v7": 0, "skellam": 0, "weighted": 0}
+        for idx in common:
+            v7p = v7_map[idx]
+            skp = sk_map[idx]
+            v7_probs = np.array([v7p["prob_away"], v7p["prob_draw"], v7p["prob_home"]])
+            sk_probs = np.array([skp["prob_away"], skp["prob_draw"], skp["prob_home"]])
+
+            # v7のdraw警戒判定
+            v7_draw_alert = (v7p["prob_draw"] >= 0.25 and
+                             abs(v7p["prob_home"] - v7p["prob_away"]) < 0.10)
+            # Skellamの高確信判定 (非draw argmax)
+            sk_max = max(sk_probs)
+            sk_argmax = np.argmax(sk_probs)
+            sk_high_conf_nondraw = (sk_max >= 0.50 and sk_argmax != 1)
+
+            if v7_draw_alert:
+                chosen = v7_probs
+                selection_log["v7"] += 1
+            elif sk_high_conf_nondraw:
+                chosen = sk_probs
+                selection_log["skellam"] += 1
+            else:
+                chosen = (v7_probs + sk_probs) / 2.0
+                chosen = chosen / chosen.sum()
+                selection_log["weighted"] += 1
+            hyb_probs.append(chosen)
+            actuals.append({"away": 0, "draw": 1, "home": 2}[v7p["actual"]])
+
+        hyb_arr = np.array(hyb_probs)
+        y_arr = np.array(actuals)
+        m = _metrics_from_probs(hyb_arr, y_arr)
+        m["selection_log"] = selection_log
+        models.setdefault("hybrid_v9", {})[season] = {"metrics": m}
 
     # --- Selection Ensemble: draw警戒時はv7, それ以外はSkellam+boost ---
     print("\n[selection] draw警戒→v7, それ以外→Skellam+...")

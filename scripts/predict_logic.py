@@ -965,6 +965,85 @@ def compute_shadow_v8_1(
     }
 
 
+def compute_hybrid_v9(
+    home_team: str, away_team: str,
+    home_stats: dict, away_stats: dict,
+    home_form: list[str], away_form: list[str],
+    v7_prediction: dict,
+    elo_home_score: float | None = None,
+    elo_away_score: float | None = None,
+    xg_home: dict | None = None,
+    xg_away: dict | None = None,
+) -> dict:
+    """
+    Hybrid v9: v7 と Skellam dynamic を動的選択する統合モデル。
+
+    選択ルール:
+    - v7のdraw警戒時 (draw>=25% かつ |home-away|<10pp) → v7 採用
+    - Skellamが高確信 (max>=50%) かつ非draw → Skellam 採用
+    - それ以外 → v7とSkellamの重み付き平均
+
+    Parameters
+    ----------
+    v7_prediction : v7による予測結果 (home_win_prob, draw_prob, away_win_prob を含む)
+    その他: Skellam計算用の入力
+
+    Returns
+    -------
+    {home_win_prob, draw_prob, away_win_prob, selection, model_version}
+    """
+    try:
+        from scripts.skellam_model import predict_skellam_dynamic
+    except ImportError:
+        from skellam_model import predict_skellam_dynamic
+
+    # Skellam dynamic予測
+    sk = predict_skellam_dynamic(
+        home_stats, away_stats,
+        elo_home_score=elo_home_score,
+        elo_away_score=elo_away_score,
+        xg_home=xg_home, xg_away=xg_away,
+    )
+
+    # 確率抽出
+    v7_h = int(v7_prediction.get("home_win_prob", 40))
+    v7_d = int(v7_prediction.get("draw_prob", 25))
+    v7_a = int(v7_prediction.get("away_win_prob", 35))
+    sk_h = sk["home_win_prob"]
+    sk_d = sk["draw_prob"]
+    sk_a = sk["away_win_prob"]
+
+    # 選択ロジック
+    v7_draw_alert = v7_d >= 25 and abs(v7_h - v7_a) < 10
+    sk_max = max(sk_h, sk_d, sk_a)
+    sk_argmax = "home" if sk_h == sk_max else ("draw" if sk_d == sk_max else "away")
+    sk_high_conf_nondraw = sk_max >= 50 and sk_argmax != "draw"
+
+    if v7_draw_alert:
+        h, d, a = v7_h, v7_d, v7_a
+        selection = "v7"
+    elif sk_high_conf_nondraw:
+        h, d, a = sk_h, sk_d, sk_a
+        selection = "skellam"
+    else:
+        # 重み付き平均 (0.5/0.5)
+        h = round((v7_h + sk_h) / 2)
+        d = round((v7_d + sk_d) / 2)
+        a = 100 - h - d
+        selection = "weighted"
+
+    return {
+        "home_win_prob": h,
+        "draw_prob": d,
+        "away_win_prob": a,
+        "predicted_score": v7_prediction.get("predicted_score", "?-?"),
+        "selection": selection,
+        "skellam_raw": {"home": sk_h, "draw": sk_d, "away": sk_a},
+        "skellam_boost": sk.get("dynamic_boost", 0.0),
+        "model_version": "hybrid_v9",
+    }
+
+
 def _build_prior_text(contributions: dict, home_team: str, away_team: str) -> str:
     """統計モデル事前確率テキストを生成 (Geminiプロンプト用)"""
     raw_adv = contributions.get("raw_home_advantage", 0.0)

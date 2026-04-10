@@ -30,6 +30,110 @@ RHO = -0.08  # 負の値で draw 0-0, 1-1 の確率をブースト
 DEFAULT_DRAW_BOOST = 0.06  # closeness-based draw boost
 
 
+def compute_dynamic_draw_boost(
+    lam_home: float,
+    lam_away: float,
+    elo_home: float | None = None,
+    elo_away: float | None = None,
+    xg_home: dict | None = None,
+    xg_away: dict | None = None,
+) -> float:
+    """
+    動的draw_boost算出関数。
+    closeness, ELO差, xG差の3シグナルから per-match の boost 値を計算する。
+
+    Parameters
+    ----------
+    lam_home, lam_away : 期待得点 (Skellamの出力から)
+    elo_home, elo_away : ELO期待勝率 (0-1)
+    xg_home, xg_away : xG dict ({"xg_for": ..., "xg_against": ...})
+
+    Returns
+    -------
+    boost_amount : 0.0 - 0.15 の範囲 (per-match, 固定値ではない)
+    """
+    signals = []
+
+    # λベース接近度: |Δλ| が 0 → 1.0, 0.8 以上 → 0
+    lam_diff = abs(lam_home - lam_away)
+    lam_close = max(0.0, 1.0 - lam_diff / 0.8)
+    signals.append(lam_close)
+
+    # ELOベース接近度: 期待勝率差 0 → 1.0, 0.5 以上 → 0
+    if elo_home is not None and elo_away is not None:
+        elo_diff = abs(elo_home - elo_away)
+        elo_close = max(0.0, 1.0 - elo_diff * 2.0)
+        signals.append(elo_close)
+
+    # xGベース接近度: xGD差 0 → 1.0, 1.5 以上 → 0
+    if xg_home and xg_away:
+        try:
+            h_xgd = float(xg_home.get("xg_for", 1.3)) - float(xg_home.get("xg_against", 1.3))
+            a_xgd = float(xg_away.get("xg_for", 1.3)) - float(xg_away.get("xg_against", 1.3))
+            xg_diff = abs(h_xgd - a_xgd)
+            xg_close = max(0.0, 1.0 - xg_diff / 1.5)
+            signals.append(xg_close)
+        except (TypeError, ValueError):
+            pass
+
+    if not signals:
+        return 0.0
+    closeness = sum(signals) / len(signals)
+
+    # ステップ関数: 高closenessでは強ブースト、低closenessでは無ブースト
+    if closeness >= 0.75:
+        return 0.12
+    elif closeness >= 0.55:
+        return 0.08
+    elif closeness >= 0.35:
+        return 0.04
+    else:
+        return 0.0
+
+
+def predict_skellam_dynamic(
+    home_stats: dict,
+    away_stats: dict,
+    home_advantage: float = 0.25,
+    elo_home_score: float | None = None,
+    elo_away_score: float | None = None,
+    xg_home: dict | None = None,
+    xg_away: dict | None = None,
+    rho: float = RHO,
+) -> dict[str, Any]:
+    """
+    動的draw_boost を適用したSkellam予測。
+    boost値は compute_dynamic_draw_boost() により per-match で計算される。
+    """
+    # 1回目: boostなしでλを得る
+    base = predict_skellam(
+        home_stats, away_stats,
+        home_advantage=home_advantage,
+        rho=rho,
+        draw_boost=0.0,
+    )
+    lam_h = base["lambda_home"]
+    lam_a = base["lambda_away"]
+
+    # 動的boost計算
+    dyn_boost = compute_dynamic_draw_boost(
+        lam_h, lam_a, elo_home_score, elo_away_score, xg_home, xg_away,
+    )
+
+    # 2回目: 動的boostを適用
+    result = predict_skellam(
+        home_stats, away_stats,
+        home_advantage=home_advantage,
+        rho=rho,
+        draw_boost=dyn_boost,
+        elo_home_score=elo_home_score,
+        elo_away_score=elo_away_score,
+    )
+    result["dynamic_boost"] = round(dyn_boost, 4)
+    result["model_version"] = "xg_skellam_dynamic"
+    return result
+
+
 def _poisson_pmf(k: int, lam: float) -> float:
     """ポアソン分布の確率質量関数"""
     if lam <= 0:
