@@ -35,10 +35,22 @@ def _write_all(predictions: list[dict]) -> None:
     )
 
 
-def save_prediction(division: str, match: dict, prediction: dict) -> str:
+def save_prediction(
+    division: str,
+    match: dict,
+    prediction: dict,
+    shadow_prediction: dict | None = None,
+    model_version: str = "v7_refined",
+) -> str:
     """
     予測を保存してIDを返す。
     同じ日付+チーム組み合わせの予測は上書きする。
+
+    Parameters
+    ----------
+    prediction : Primary modelの予測 (UI表示用)
+    shadow_prediction : Shadow modelの予測 (内部ログ用、None可)
+    model_version : Primary modelのバージョン識別子
     """
     predictions = load_all()
     key = f"{match['date']}_{match['home']}_{match['away']}"
@@ -56,6 +68,26 @@ def save_prediction(division: str, match: dict, prediction: dict) -> str:
     else:
         pred_winner = "draw"
 
+    # Shadow predictionの整形
+    shadow_entry = None
+    if shadow_prediction:
+        sh = int(shadow_prediction.get("home_win_prob", 40))
+        sd = int(shadow_prediction.get("draw_prob", 25))
+        sa = int(shadow_prediction.get("away_win_prob", 35))
+        if sh >= sa and sh >= sd:
+            s_winner = "home"
+        elif sa > sh and sa >= sd:
+            s_winner = "away"
+        else:
+            s_winner = "draw"
+        shadow_entry = {
+            "home_win_prob": sh,
+            "draw_prob": sd,
+            "away_win_prob": sa,
+            "pred_winner": s_winner,
+            "model_version": shadow_prediction.get("model_version", "shadow"),
+        }
+
     pred_id = str(uuid.uuid4())[:8]
     predictions.insert(0, {
         "id":       pred_id,
@@ -63,6 +95,8 @@ def save_prediction(division: str, match: dict, prediction: dict) -> str:
         "saved_at": datetime.now().isoformat(),
         "division": division,
         "match":    match,
+        "model_version": model_version,
+        "role":     "primary",
         "prediction": {
             "home_win_prob":   h,
             "draw_prob":       d,
@@ -72,6 +106,7 @@ def save_prediction(division: str, match: dict, prediction: dict) -> str:
             "pred_winner":     pred_winner,
             "model":           prediction.get("model", ""),
         },
+        "shadow_prediction": shadow_entry,
         "actual": None,
     })
     _write_all(predictions)

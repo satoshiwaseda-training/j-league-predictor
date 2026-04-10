@@ -26,35 +26,64 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ─── Gemini v8 設計重み (2026-04-10 第7回設計会議) ─────
+# ─── Primary Model: v7 refined (本番UI主力) ─────────────
 # 重み合計 = 1.00
-# 変更: ELO 0.13→0.20 (制約付き再最適化, val=2025 logL最良)
-# 新ファクター: チーム別ホームADV, H2H実データ, 昇格組補正
-# 検証: 804試合, val=377, 2026holdout=41, draw 40-55制約
+# 設計: 2026-04-09 (ELO重み再適合済み)
+# 新ファクター3件 (チーム別ホームADV, H2H実データ, 昇格組補正) は維持
 MODEL_WEIGHTS: dict[str, float] = {
-    "team_strength":                0.1158,  # 勝点・順位差
-    "attack_rate":                  0.0787,  # 得点率/試合 (Dixon-Coles lambda)
-    "defense_rate":                 0.0589,  # 失点率/試合 (Dixon-Coles mu)
-    "recent_form":                  0.1339,  # 直近フォームPPG
-    "xg_for":                       0.0299,  # 期待得点 (攻撃力)
-    "xg_against":                   0.0299,  # 期待失点 (守備力)
-    "home_advantage":               0.0787,  # チーム別ホームADV
-    "capital_power":                0.0977,  # 資本力 (R2=0.65-0.72 vs 勝点)
-    "head_to_head":                 0.0299,  # H2H (実データ化済み)
-    "discipline_risk":              0.0299,  # 規律・カード累積リスク
-    "attrition_rate":               0.0299,  # 損耗率 (スカッド比率)
-    "match_interval":               0.0299,  # 試合間隔疲労 U字型
-    "injury_impact":                0.0090,  # 個別怪我絶対数
-    "weather_fatigue":              0.0090,  # 天気疲労 (効果小)
+    "team_strength":                0.1260,  # 勝点・順位差
+    "attack_rate":                  0.0856,  # 得点率/試合 (Dixon-Coles lambda)
+    "defense_rate":                 0.0640,  # 失点率/試合 (Dixon-Coles mu)
+    "recent_form":                  0.1456,  # 直近フォームPPG
+    "xg_for":                       0.0325,  # 期待得点 (攻撃力)
+    "xg_against":                   0.0325,  # 期待失点 (守備力)
+    "home_advantage":               0.0856,  # チーム別ホームADV
+    "capital_power":                0.1063,  # 資本力 (R2=0.65-0.72 vs 勝点)
+    "head_to_head":                 0.0325,  # H2H (実データ化済み)
+    "discipline_risk":              0.0325,  # 規律・カード累積リスク
+    "attrition_rate":               0.0325,  # 損耗率 (スカッド比率)
+    "match_interval":               0.0325,  # 試合間隔疲労 U字型
+    "injury_impact":                0.0098,  # 個別怪我絶対数
+    "weather_fatigue":              0.0098,  # 天気疲労 (効果小)
     "travel_distance":              0.0000,  # 移動距離 (実質0)
     "set_piece_conversion":         0.0000,  # (inactive)
     "match_day_motivation":         0.0000,  # (inactive)
     "tactical_adaptability":        0.0000,  # (inactive)
-    "expected_goals_difference":    0.0389,  # xGD
+    "expected_goals_difference":    0.0423,  # xGD
     "player_availability_impact":   0.0000,  # (inactive)
     "match_trend":                  0.0000,  # (inactive)
     "referee_tendency":             0.0000,  # (inactive)
-    "elo":                          0.2000,  # ELOレーティング (v8制約付き最適値)
+    "elo":                          0.1300,  # ELOレーティング (v7値)
+}
+
+# ─── Shadow Model: v8.1 (内部ログ・比較用, UIには非表示) ──
+# 重み合計 = 1.00
+# val=2025で logL/Brier が過去最良 (1.045/0.628)
+# UIには使わず、prediction_store に shadow として保存
+V8_1_MODEL_WEIGHTS: dict[str, float] = {
+    "team_strength":                0.1158,
+    "attack_rate":                  0.0787,
+    "defense_rate":                 0.0589,
+    "recent_form":                  0.1339,
+    "xg_for":                       0.0299,
+    "xg_against":                   0.0299,
+    "home_advantage":               0.0787,
+    "capital_power":                0.0977,
+    "head_to_head":                 0.0299,
+    "discipline_risk":              0.0299,
+    "attrition_rate":               0.0299,
+    "match_interval":               0.0299,
+    "injury_impact":                0.0090,
+    "weather_fatigue":              0.0090,
+    "travel_distance":              0.0000,
+    "set_piece_conversion":         0.0000,
+    "match_day_motivation":         0.0000,
+    "tactical_adaptability":        0.0000,
+    "expected_goals_difference":    0.0389,
+    "player_availability_impact":   0.0000,
+    "match_trend":                  0.0000,
+    "referee_tendency":             0.0000,
+    "elo":                          0.2000,  # ELO 0.20 (v8.1)
 }
 
 # ─── J1〜J3 チーム推定資本力スコア (静的DB) ────────────
@@ -794,13 +823,22 @@ def _softmax3(lh: float, ld: float, la: float) -> tuple[float, float, float]:
 
 
 # 3ロジット変換のパラメータ (v7再探索済み, val=2025 F1=0.435)
-# 3ロジット変換パラメータ (v8.1 制約付き再最適化, val=2025 logL=1.045最良)
+# 3ロジット変換パラメータ - Primary (v7 refined)
 _3LOGIT_PARAMS = {
-    "scale_ha":   1.70,    # 勝敗方向の感度
-    "bias_home":  0.12,    # ホームバイアス (チーム別ADV対応)
-    "bias_away":  0.07,    # アウェイバイアス
-    "scale_draw": 1.10,    # draw感度 (制約: 1.0-1.3)
-    "bias_draw":  -0.90,   # drawベースロジット (bd=-1.2付近→-0.9で最適)
+    "scale_ha":   1.44,    # 勝敗方向の感度 (v7)
+    "bias_home":  0.14,    # ホームバイアス (v7)
+    "bias_away":  0.07,    # アウェイバイアス (v7)
+    "scale_draw": 0.80,    # draw感度 (v7)
+    "bias_draw":  -0.60,   # drawベースロジット (v7)
+}
+
+# 3ロジット変換パラメータ - Shadow v8.1 (比較用)
+V8_1_3LOGIT_PARAMS = {
+    "scale_ha":   1.70,
+    "bias_home":  0.12,
+    "bias_away":  0.07,
+    "scale_draw": 1.10,
+    "bias_draw":  -0.90,
 }
 
 
@@ -831,7 +869,11 @@ def advantage_to_probs(
     if mode == "legacy":
         return _legacy_advantage_to_probs(raw_advantage)
 
-    p = _3LOGIT_PARAMS
+    # mode="v8.1": shadow model
+    if mode == "v8.1":
+        p = V8_1_3LOGIT_PARAMS
+    else:
+        p = _3LOGIT_PARAMS
     logit_h = p["scale_ha"] * raw_advantage + p["bias_home"]
     logit_a = -p["scale_ha"] * raw_advantage + p["bias_away"]
     logit_d = p["scale_draw"] * closeness + p["bias_draw"]
@@ -862,6 +904,66 @@ def _legacy_advantage_to_probs(raw_advantage: float) -> tuple[int, int, int]:
 
 
 # ─── Gemini 2.5 Flash 統合予測 ──────────────────────────
+
+def compute_shadow_v8_1(
+    home_team: str, away_team: str,
+    home_stats: dict, away_stats: dict,
+    home_form: list[str], away_form: list[str],
+    elo_home_score: float | None = None,
+    elo_away_score: float | None = None,
+) -> dict:
+    """
+    Shadow model v8.1 による予測を計算する。
+    Primary (v7) とは独立にraw_advantageとclosenessを計算し、
+    V8_1_3LOGIT_PARAMS を使って確率に変換する。
+
+    Returns: {"home_win_prob", "draw_prob", "away_win_prob",
+              "raw_home_advantage", "closeness", "model_version"}
+    """
+    # v8.1の重みを一時的に使ってraw_advantageを再計算
+    h_str, a_str = score_team_strength(home_stats, away_stats)
+    h_atk, a_atk = score_attack_rate(home_stats, away_stats)
+    h_def, a_def = score_defense_rate(home_stats, away_stats)
+    h_form_s = score_recent_form(home_form)
+    a_form_s = score_recent_form(away_form)
+    h_ha = score_home_advantage(home_team)
+    a_ha = 1.0 - h_ha
+    h_cap, a_cap = score_capital_power(home_team, away_team)
+
+    # ELO
+    if elo_home_score is None:
+        elo_home_score = 0.5
+    if elo_away_score is None:
+        elo_away_score = 0.5
+    # 昇格組ペナルティ
+    if home_team in _PROMOTED_2026:
+        elo_home_score = max(0.0, elo_home_score - _PROMOTED_ELO_PENALTY)
+    if away_team in _PROMOTED_2026:
+        elo_away_score = max(0.0, elo_away_score - _PROMOTED_ELO_PENALTY)
+
+    W = V8_1_MODEL_WEIGHTS
+    raw_adv = (
+        (h_str - a_str) * W.get("team_strength", 0)
+        + (h_atk - a_atk) * W.get("attack_rate", 0)
+        + (h_def - a_def) * W.get("defense_rate", 0)
+        + (h_form_s - a_form_s) * W.get("recent_form", 0)
+        + (h_ha - a_ha) * W.get("home_advantage", 0)
+        + (h_cap - a_cap) * W.get("capital_power", 0)
+        + (elo_home_score - elo_away_score) * W.get("elo", 0)
+    )
+    closeness = max(0.0, 1.0 - abs(raw_adv) * 3.0)
+
+    h_pct, d_pct, a_pct = advantage_to_probs(raw_adv, closeness, mode="v8.1")
+
+    return {
+        "home_win_prob": h_pct,
+        "draw_prob": d_pct,
+        "away_win_prob": a_pct,
+        "raw_home_advantage": round(raw_adv, 4),
+        "closeness": round(closeness, 4),
+        "model_version": "v8.1_shadow",
+    }
+
 
 def _build_prior_text(contributions: dict, home_team: str, away_team: str) -> str:
     """統計モデル事前確率テキストを生成 (Geminiプロンプト用)"""

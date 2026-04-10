@@ -1214,7 +1214,19 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             snapshots.append(build_feature_snapshot(
                 match, prediction, contributions, pipeline, gemini_used,
             ))
-            store_save(division, match, prediction)
+            # Shadow v8.1 併走予測
+            try:
+                from scripts.predict_logic import compute_shadow_v8_1
+                shadow_pred = compute_shadow_v8_1(
+                    home, away, home_stats, away_stats,
+                    home_form, away_form,
+                    elo_home_score=elo_h, elo_away_score=elo_a,
+                )
+            except Exception:
+                shadow_pred = None
+            store_save(division, match, prediction,
+                       shadow_prediction=shadow_pred,
+                       model_version="v7_refined")
         except Exception as exc:
             preds.append({"match": match, "error": str(exc),
                           "classification": {"confidence_level": "low", "draw_alert": False}})
