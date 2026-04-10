@@ -1180,7 +1180,8 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 home_days=home_days, away_days=away_days,
                 elo_home_score=elo_h, elo_away_score=elo_a,
             )
-            prediction = predict_with_gemini(
+            # v7 predict (baseline/Gemini reasoning生成)
+            v7_prediction = predict_with_gemini(
                 home, away, contributions,
                 home_stats, away_stats,
                 home_form, away_form, h2h, weather,
@@ -1190,14 +1191,45 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 home_injuries=home_inj, away_injuries=away_inj,
             )
             closeness = contributions.get("closeness", 0.5)
+
+            # Primary model selection (hybrid_v9.1 or v7 fallback)
+            from scripts.predict_logic import PRIMARY_MODEL_VERSION, compute_hybrid_v9, compute_shadow_v8_1
+            if PRIMARY_MODEL_VERSION == "hybrid_v9.1":
+                try:
+                    hybrid = compute_hybrid_v9(
+                        home, away, home_stats, away_stats,
+                        home_form, away_form,
+                        v7_prediction=v7_prediction,
+                        elo_home_score=elo_h, elo_away_score=elo_a,
+                        xg_home=home_xg, xg_away=away_xg,
+                    )
+                    # Primary = hybrid probs + v7のreasoning/score/confidence
+                    prediction = dict(v7_prediction)
+                    prediction["home_win_prob"] = hybrid["home_win_prob"]
+                    prediction["draw_prob"] = hybrid["draw_prob"]
+                    prediction["away_win_prob"] = hybrid["away_win_prob"]
+                    prediction["hybrid_selection"] = hybrid["selection"]
+                    prediction["skellam_raw"] = hybrid.get("skellam_raw", {})
+                    prediction["skellam_boost"] = hybrid.get("skellam_boost", 0)
+                    prediction["model_version"] = "hybrid_v9.1"
+                    primary_version = "hybrid_v9.1"
+                except Exception:
+                    # Fallback to v7 if hybrid fails
+                    prediction = v7_prediction
+                    primary_version = "v7_refined"
+            else:
+                prediction = v7_prediction
+                primary_version = "v7_refined"
+
             cls = _classify_prediction(prediction, closeness)
-            gemini_used = "gemini" in str(prediction.get("model", "")).lower()
+            gemini_used = "gemini" in str(v7_prediction.get("model", "")).lower()
             dq = compute_data_quality(pipeline, home_xg, away_xg, gemini_used)
-            # 統計モデル事前確率 → Gemini差分
+            # 統計モデル事前確率 → 補正差分 (v7との差分を表示)
             stat_h, stat_d, stat_a = advantage_to_probs(
                 contributions["raw_home_advantage"], closeness)
+            # primary vs statの差分
             gem_diff = None
-            if gemini_used:
+            if gemini_used or primary_version == "hybrid_v9.1":
                 gem_diff = {
                     "home": int(prediction.get("home_win_prob", stat_h)) - stat_h,
                     "draw": int(prediction.get("draw_prob", stat_d)) - stat_d,
@@ -1216,7 +1248,6 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             ))
             # Shadow v8.1 併走予測
             try:
-                from scripts.predict_logic import compute_shadow_v8_1
                 shadow_pred = compute_shadow_v8_1(
                     home, away, home_stats, away_stats,
                     home_form, away_form,
@@ -1224,9 +1255,14 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 )
             except Exception:
                 shadow_pred = None
-            store_save(division, match, prediction,
-                       shadow_prediction=shadow_pred,
-                       model_version="v7_refined")
+            # 保存: primary(hybrid), baseline(v7), shadow(v8.1)
+            store_save(
+                division, match, prediction,
+                shadow_prediction=shadow_pred,
+                baseline_prediction=v7_prediction,
+                model_version=primary_version,
+                baseline_model_version="v7_refined",
+            )
         except Exception as exc:
             preds.append({"match": match, "error": str(exc),
                           "classification": {"confidence_level": "low", "draw_alert": False}})

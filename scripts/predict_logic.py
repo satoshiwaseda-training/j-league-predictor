@@ -26,7 +26,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ─── Primary Model: v7 refined (本番UI主力) ─────────────
+# ─── Primary Model Selector ─────────────────────────────
+# "hybrid_v9.1" = 本番昇格済み (v7 + Skellam dynamic の統合モデル)
+# "v7_refined"  = fallback (hybrid_v9.1 を無効化したい場合)
+# この定数を変更するだけで primary を切り替え可能
+PRIMARY_MODEL_VERSION = "hybrid_v9.1"
+
+
+# ─── Baseline Model: v7 refined (fallback 用, baseline比較用) ─────────────
 # 重み合計 = 1.00
 # 設計: 2026-04-09 (ELO重み再適合済み)
 # 新ファクター3件 (チーム別ホームADV, H2H実データ, 昇格組補正) は維持

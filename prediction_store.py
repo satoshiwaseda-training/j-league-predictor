@@ -35,12 +35,36 @@ def _write_all(predictions: list[dict]) -> None:
     )
 
 
+def _format_side_prediction(pred: dict, version: str) -> dict:
+    """副次予測 (baseline/shadow) の保存用フォーマット"""
+    if not pred:
+        return None
+    h = int(pred.get("home_win_prob", 40))
+    d = int(pred.get("draw_prob", 25))
+    a = int(pred.get("away_win_prob", 35))
+    if h >= a and h >= d:
+        w = "home"
+    elif a > h and a >= d:
+        w = "away"
+    else:
+        w = "draw"
+    return {
+        "home_win_prob": h,
+        "draw_prob": d,
+        "away_win_prob": a,
+        "pred_winner": w,
+        "model_version": pred.get("model_version", version),
+    }
+
+
 def save_prediction(
     division: str,
     match: dict,
     prediction: dict,
     shadow_prediction: dict | None = None,
-    model_version: str = "v7_refined",
+    baseline_prediction: dict | None = None,
+    model_version: str = "hybrid_v9.1",
+    baseline_model_version: str = "v7_refined",
 ) -> str:
     """
     予測を保存してIDを返す。
@@ -49,8 +73,10 @@ def save_prediction(
     Parameters
     ----------
     prediction : Primary modelの予測 (UI表示用)
-    shadow_prediction : Shadow modelの予測 (内部ログ用、None可)
+    baseline_prediction : Baseline model (v7) の予測 (fallback/比較用)
+    shadow_prediction : Shadow modelの予測 (v8.1等, 内部ログ用)
     model_version : Primary modelのバージョン識別子
+    baseline_model_version : Baseline modelのバージョン識別子
     """
     predictions = load_all()
     key = f"{match['date']}_{match['home']}_{match['away']}"
@@ -68,25 +94,8 @@ def save_prediction(
     else:
         pred_winner = "draw"
 
-    # Shadow predictionの整形
-    shadow_entry = None
-    if shadow_prediction:
-        sh = int(shadow_prediction.get("home_win_prob", 40))
-        sd = int(shadow_prediction.get("draw_prob", 25))
-        sa = int(shadow_prediction.get("away_win_prob", 35))
-        if sh >= sa and sh >= sd:
-            s_winner = "home"
-        elif sa > sh and sa >= sd:
-            s_winner = "away"
-        else:
-            s_winner = "draw"
-        shadow_entry = {
-            "home_win_prob": sh,
-            "draw_prob": sd,
-            "away_win_prob": sa,
-            "pred_winner": s_winner,
-            "model_version": shadow_prediction.get("model_version", "shadow"),
-        }
+    shadow_entry = _format_side_prediction(shadow_prediction, "shadow")
+    baseline_entry = _format_side_prediction(baseline_prediction, baseline_model_version)
 
     pred_id = str(uuid.uuid4())[:8]
     predictions.insert(0, {
@@ -96,6 +105,7 @@ def save_prediction(
         "division": division,
         "match":    match,
         "model_version": model_version,
+        "baseline_model_version": baseline_model_version,
         "role":     "primary",
         "prediction": {
             "home_win_prob":   h,
@@ -105,8 +115,10 @@ def save_prediction(
             "confidence":      prediction.get("confidence", "medium"),
             "pred_winner":     pred_winner,
             "model":           prediction.get("model", ""),
+            "hybrid_selection": prediction.get("hybrid_selection", ""),
         },
-        "shadow_prediction": shadow_entry,
+        "baseline_prediction": baseline_entry,
+        "shadow_prediction":   shadow_entry,
         "actual": None,
     })
     _write_all(predictions)
