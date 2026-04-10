@@ -1088,8 +1088,16 @@ def render_onebutton(division: str):
 
     if run_btn:
         st.session_state["_onebutton_running"] = True
-        _run_onebutton_pipeline(division, cache_key)
-        st.session_state["_onebutton_running"] = False
+        try:
+            _run_onebutton_pipeline(division, cache_key)
+        except Exception as _pipe_err:
+            st.session_state["_onebutton_running"] = False
+            st.error(f"パイプライン実行中にエラーが発生しました: {_pipe_err}")
+            import traceback as _tb
+            st.code(_tb.format_exc())
+            return
+        finally:
+            st.session_state["_onebutton_running"] = False
 
     # ── 結果表示 ──
     if cache_key not in st.session_state:
@@ -1264,11 +1272,31 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 baseline_model_version="v7_refined",
             )
         except Exception as exc:
-            preds.append({"match": match, "error": str(exc),
-                          "classification": {"confidence_level": "low", "draw_alert": False}})
+            import traceback as _tb
+            preds.append({
+                "match": match,
+                "error": str(exc),
+                "error_trace": _tb.format_exc(),
+                "classification": {"confidence_level": "low", "draw_alert": False},
+            })
 
     progress.progress(1.0, text="完了!")
     progress.empty()
+
+    # エラー率チェック: 全試合がエラーなら明示的に報告
+    n_errors = sum(1 for p in preds if "error" in p)
+    if n_errors == len(preds) and preds:
+        first_err = preds[0]
+        st.error(f"全 {len(preds)} 試合で予測エラーが発生しました")
+        st.error(f"エラー: {first_err.get('error', 'unknown')}")
+        trace = first_err.get("error_trace", "")
+        if trace:
+            with st.expander("スタックトレース", expanded=False):
+                st.code(trace)
+        # cache_keyはセットせずに return
+        return
+    elif n_errors > 0:
+        st.warning(f"{n_errors}/{len(preds)} 試合で予測エラーが発生しました (他は正常)")
 
     st.session_state[cache_key] = {
         "preds": preds,
