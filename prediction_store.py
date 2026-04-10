@@ -102,6 +102,7 @@ def save_prediction(
         "id":       pred_id,
         "_key":     key,
         "saved_at": datetime.now().isoformat(),
+        "schema_version": "v2",
         "division": division,
         "match":    match,
         "model_version": model_version,
