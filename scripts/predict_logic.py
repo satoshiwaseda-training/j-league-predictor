@@ -976,21 +976,17 @@ def compute_hybrid_v9(
     xg_away: dict | None = None,
 ) -> dict:
     """
-    Hybrid v9: v7 と Skellam dynamic を動的選択する統合モデル。
+    Hybrid v9.1 (攻撃型): v7 と Skellam dynamic を動的選択する統合モデル。
 
-    選択ルール:
-    - v7のdraw警戒時 (draw>=25% かつ |home-away|<10pp) → v7 採用
-    - Skellamが高確信 (max>=50%) かつ非draw → Skellam 採用
-    - それ以外 → v7とSkellamの重み付き平均
+    選択ルール (最適化済み, draw 40-55制約内):
+    1. v7 draw警戒 (draw>=30% かつ |H-A|<10pp) → v7採用
+    2. Skellam高確信 (max>=48% かつ 非draw) → Skellam採用
+    3. Clear favorite (|λ差|>=0.5 or |ELO差|>=0.15) かつ Skellam非draw → Skellam採用
+    4. それ以外 → Skellam 0.5 + v7 0.5 の重み付き平均
 
-    Parameters
-    ----------
-    v7_prediction : v7による予測結果 (home_win_prob, draw_prob, away_win_prob を含む)
-    その他: Skellam計算用の入力
-
-    Returns
-    -------
-    {home_win_prob, draw_prob, away_win_prob, selection, model_version}
+    val=2025 n=377: acc=0.475 F1=0.428 draw=55 drawF1=0.276
+    2026 holdout n=41: acc=0.415 F1=0.349
+    選択割合 val=2025: v7 45% / Skellam 42% / weighted 13%
     """
     try:
         from scripts.skellam_model import predict_skellam_dynamic
@@ -1012,21 +1008,28 @@ def compute_hybrid_v9(
     sk_h = sk["home_win_prob"]
     sk_d = sk["draw_prob"]
     sk_a = sk["away_win_prob"]
+    lam_h = sk.get("lambda_home", 1.3)
+    lam_a = sk.get("lambda_away", 1.3)
 
-    # 選択ロジック
-    v7_draw_alert = v7_d >= 25 and abs(v7_h - v7_a) < 10
+    # 選択ロジック (v9.1 攻撃型)
+    v7_draw_alert = v7_d >= 30 and abs(v7_h - v7_a) < 10
     sk_max = max(sk_h, sk_d, sk_a)
     sk_argmax = "home" if sk_h == sk_max else ("draw" if sk_d == sk_max else "away")
-    sk_high_conf_nondraw = sk_max >= 50 and sk_argmax != "draw"
+    sk_high_conf_nondraw = sk_max >= 48 and sk_argmax != "draw"
+
+    # Clear favorite判定
+    lam_diff = abs(lam_h - lam_a)
+    elo_diff = abs((elo_home_score or 0.5) - (elo_away_score or 0.5))
+    clear_favorite = (lam_diff >= 0.5 or elo_diff >= 0.15) and sk_argmax != "draw"
 
     if v7_draw_alert:
         h, d, a = v7_h, v7_d, v7_a
         selection = "v7"
-    elif sk_high_conf_nondraw:
+    elif sk_high_conf_nondraw or clear_favorite:
         h, d, a = sk_h, sk_d, sk_a
         selection = "skellam"
     else:
-        # 重み付き平均 (0.5/0.5)
+        # 重み付き平均 (Skellam 0.5 / v7 0.5)
         h = round((v7_h + sk_h) / 2)
         d = round((v7_d + sk_d) / 2)
         a = 100 - h - d
@@ -1040,7 +1043,7 @@ def compute_hybrid_v9(
         "selection": selection,
         "skellam_raw": {"home": sk_h, "draw": sk_d, "away": sk_a},
         "skellam_boost": sk.get("dynamic_boost", 0.0),
-        "model_version": "hybrid_v9",
+        "model_version": "hybrid_v9.1",
     }
 
 

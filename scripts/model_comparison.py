@@ -203,6 +203,10 @@ def _run_skellam_dynamic_walk_forward(all_results: list[dict], eval_season: int)
             "predicted": max([("home", sp["home_win_prob"]), ("draw", sp["draw_prob"]),
                               ("away", sp["away_win_prob"])], key=lambda x: x[1])[0],
             "dynamic_boost": sp.get("dynamic_boost", 0.0),
+            "lambda_home": sp.get("lambda_home", 1.3),
+            "lambda_away": sp.get("lambda_away", 1.3),
+            "elo_home": elo_h,
+            "elo_away": elo_a,
         })
 
     if not predictions:
@@ -379,6 +383,70 @@ def run_full_comparison() -> dict:
         m = _metrics_from_probs(hyb_arr, y_arr)
         m["selection_log"] = selection_log
         models.setdefault("hybrid_v9", {})[season] = {"metrics": m}
+
+    # --- Hybrid v9.1 攻撃型: Skellam優先、weighted削減 ---
+    # 選択ロジック:
+    #   1. v7 draw警戒 (厳格化: draw>=28% かつ |H-A|<8pp) → v7
+    #   2. Skellam max >= 47% かつ非draw → Skellam
+    #   3. Clear favorite (|λ差|>=0.5 OR |ELO差|>=0.15) → Skellam
+    #   4. それ以外 → weighted (削減済み)
+    print("\n[hybrid v9.1] 攻撃型: Skellam優先 + weighted削減")
+    for season in [2025, 2026]:
+        v7_preds = models["v7"][season].get("predictions", [])
+        sk_preds = models["skellam_dyn"][season].get("predictions", [])
+        if not v7_preds or not sk_preds:
+            continue
+        v7_map = {p["idx"]: p for p in v7_preds}
+        sk_map = {p["idx"]: p for p in sk_preds}
+        common = sorted(set(v7_map) & set(sk_map))
+
+        hyb_probs = []
+        actuals = []
+        selection_log = {"v7": 0, "skellam": 0, "weighted": 0}
+        for idx in common:
+            v7p = v7_map[idx]
+            skp = sk_map[idx]
+            v7_probs = np.array([v7p["prob_away"], v7p["prob_draw"], v7p["prob_home"]])
+            sk_probs = np.array([skp["prob_away"], skp["prob_draw"], skp["prob_home"]])
+
+            # v7 draw警戒 (厳格化)
+            v7_draw_alert = (v7p["prob_draw"] >= 0.28 and
+                             abs(v7p["prob_home"] - v7p["prob_away"]) < 0.08)
+
+            # Skellam高確信 (閾値緩和 50%→47%)
+            sk_max = max(sk_probs)
+            sk_argmax = np.argmax(sk_probs)
+            sk_high_conf_nondraw = (sk_max >= 0.47 and sk_argmax != 1)
+
+            # Clear favorite 判定 (Skellamの期待得点差 or ELO差)
+            lam_diff = abs(skp.get("lambda_home", 1.3) - skp.get("lambda_away", 1.3))
+            elo_h = skp.get("elo_home")
+            elo_a = skp.get("elo_away")
+            elo_diff = abs(elo_h - elo_a) if (elo_h is not None and elo_a is not None) else 0
+            clear_favorite = (lam_diff >= 0.5 or elo_diff >= 0.15)
+
+            if v7_draw_alert:
+                chosen = v7_probs
+                selection_log["v7"] += 1
+            elif sk_high_conf_nondraw:
+                chosen = sk_probs
+                selection_log["skellam"] += 1
+            elif clear_favorite and sk_argmax != 1:
+                chosen = sk_probs
+                selection_log["skellam"] += 1
+            else:
+                # weighted (minimized): Skellam重め (0.6) + v7 (0.4)
+                chosen = 0.6 * sk_probs + 0.4 * v7_probs
+                chosen = chosen / chosen.sum()
+                selection_log["weighted"] += 1
+            hyb_probs.append(chosen)
+            actuals.append({"away": 0, "draw": 1, "home": 2}[v7p["actual"]])
+
+        hyb_arr = np.array(hyb_probs)
+        y_arr = np.array(actuals)
+        m = _metrics_from_probs(hyb_arr, y_arr)
+        m["selection_log"] = selection_log
+        models.setdefault("hybrid_v9.1", {})[season] = {"metrics": m}
 
     # --- Selection Ensemble: draw警戒時はv7, それ以外はSkellam+boost ---
     print("\n[selection] draw警戒→v7, それ以外→Skellam+...")
