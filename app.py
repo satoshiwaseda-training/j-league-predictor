@@ -978,14 +978,27 @@ def render_prediction(match: dict, division: str):
 # ─── ワンボタン予測パイプライン ────────────────────────────
 
 def _classify_prediction(pred: dict, closeness: float = 0.5) -> dict:
-    """予測の確信度とdraw警戒を判定"""
+    """
+    予測の確信度とdraw警戒を判定。
+
+    確信度閾値 (hybrid_v9.1 の max_prob 分布に合わせ調整済み):
+    - high: max_prob >= 47 (約31%の試合)
+    - medium: 37 <= max_prob < 47 (約40%の試合)
+    - low: max_prob < 37 (約30%の試合)
+
+    旧閾値 (50/40) では hybrid_v9.1 の 2極化出力 (大多数が34-39%か50%+)
+    により medium がほぼ0になる問題を修正。
+
+    draw_alert は confidence_level と独立:
+    draw警戒試合でも medium/high/low のいずれかに確実にカウントされる。
+    """
     h = int(pred.get("home_win_prob", 40))
     d = int(pred.get("draw_prob", 25))
     a = int(pred.get("away_win_prob", 35))
     mx = max(h, d, a)
-    if mx >= 50:
+    if mx >= 47:
         confidence_level = "high"
-    elif mx >= 40:
+    elif mx >= 37:
         confidence_level = "medium"
     else:
         confidence_level = "low"
@@ -1471,27 +1484,21 @@ def _render_onebutton_results(result: dict, division: str):
     c1.metric("高確信", f"{n_high}試合",
               delta=f"Draw警戒 {n_high_draw}" if n_high_draw else None,
               delta_color="off",
-              help="max_prob >= 50%. Draw警戒は重複カウント")
+              help="max_prob >= 47%. Draw警戒は独立軸で重複カウント")
     c2.metric("中確信", f"{n_mid}試合",
               delta=f"Draw警戒 {n_mid_draw}" if n_mid_draw else None,
               delta_color="off",
-              help="max_prob 40-50%. 0件の場合は fallback動作中の可能性")
+              help="max_prob 37-47%. Draw警戒は独立軸で重複カウント")
     c3.metric("低確信", f"{n_low}試合",
               delta=f"Draw警戒 {n_low_draw}" if n_low_draw else None,
               delta_color="off",
-              help="max_prob < 40%")
-    c4.metric("Draw警戒", f"{n_draw}試合", help="draw >= 25% かつ closeness >= 0.5 (確信度と独立、重複カウント)")
+              help="max_prob < 37%")
+    c4.metric("Draw警戒", f"{n_draw}試合",
+              help="draw >= 25% かつ closeness >= 0.5 (確信度と独立、重複カウント)")
     c5.metric("直近正答率", acc_text or "--",
               delta=f"n={acc_n}" if acc_n else None,
               delta_color="off",
               help="成績記録タブで結果登録後に表示")
-
-    # 中確信0件時の注意文言
-    if n_mid == 0 and (n_high + n_low) > 0:
-        st.caption(
-            "⚠ 中確信0件です。Primary model (hybrid_v9.1) の標準分布では "
-            "中確信は全体の約29%になるはずです。fallback動作中の可能性があります。"
-        )
 
     # ── 今日の注目試合 ──
     _render_spotlight(valid)
