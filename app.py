@@ -1780,9 +1780,43 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         "caution": "border-left:3px solid #eab308;",
     }.get(spotlight, "")
 
+    # 戦略ラベル (confidence × draw_alert × dq_rank)
+    strategy = _get_strategy_label(cl, cls.get("draw_alert", False), dq_rank)
+    # カード左ボーダーを戦略ラベル優先で上書き
+    if strategy["priority"] == 0:
+        # 最強 → ゴールドボーダー
+        spot_border = "border-left:4px solid #f59e0b;"
+    elif not spot_border and strategy["priority"] >= 4:
+        # 見送り系はグレーに
+        spot_border = "border-left:3px solid #cbd5e1;"
+    strategy_tooltip = _html_mod.escape(strategy["description"])
+    # 最強は特大バッジ、それ以外は通常サイズ
+    if strategy["priority"] == 0:
+        strat_badge_html = (
+            f'<div style="text-align:center;padding:0.4rem 0.6rem;margin-bottom:0.5rem;'
+            f'background:linear-gradient(90deg,#fef3c7 0%,#fde68a 100%);'
+            f'border:2px solid #f59e0b;border-radius:8px;'
+            f'font-size:0.85rem;font-weight:900;color:#92400e;'
+            f'box-shadow:0 1px 3px rgba(245,158,11,0.2);cursor:help;" '
+            f'title="{strategy_tooltip}">'
+            f'{strategy["icon"]} {strategy["label"]} — 最も信頼できる組み合わせ'
+            f'</div>'
+        )
+    else:
+        strat_badge_html = (
+            f'<div style="text-align:center;padding:0.25rem 0.5rem;margin-bottom:0.4rem;'
+            f'background:{strategy["bg"]};border:1px solid {strategy["border"]};'
+            f'border-radius:6px;font-size:0.74rem;font-weight:700;'
+            f'color:{strategy["color"]};cursor:help;" '
+            f'title="{strategy_tooltip}">'
+            f'{strategy["icon"]} {strategy["label"]}'
+            f'</div>'
+        )
+
     # カードHTML: ヘッダー+確率バー (固定長、reasoningを含まない)
     card_header = (
         f'<div class="card" style="margin-bottom:0.8rem;{spot_border}">'
+        f'{strat_badge_html}'
         f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">'
         f'<span style="font-size:0.7rem;color:#4b5563;">'
         f'{spot_icon} {match["date"]} {match.get("time","?")} | {match.get("venue","?")}'
@@ -1821,11 +1855,138 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
     st.markdown(card_header, unsafe_allow_html=True)
 
 
+def _get_strategy_label(
+    confidence: str,
+    draw_alert: bool,
+    dq_rank: str = "B",
+) -> dict:
+    """
+    confidence x draw_alert x dq_rank から戦略ラベルを決定する。
+
+    戦略マトリクス (validation 実証済み正答率):
+    ------------------------------------------------
+    | confidence | draw_alert | ラベル       | 2025  | 2026  |
+    |------------|-----------|--------------|-------|-------|
+    | high       | Yes       | 最強 ★       | 75.0% | 80.0% |
+    | high       | No        | 本命         | 53.0% | 33.3% |
+    | medium     | Yes       | 波乱狙い ⚡  | 41.8% | 45.5% |
+    | medium     | No (A/B)  | 組み合わせ 🎯| 56.3% | 40.0% |
+    | medium     | No (C/D)  | 要注意       | --    | --    |
+    | low        | Yes       | スキップ ⛔  | 39.9% | 10.0% |
+    | low        | No        | 見送り ⏭    | 44.4% | 100%  |
+
+    Returns
+    -------
+    {
+        "label": str,       # 表示名
+        "icon": str,        # 絵文字
+        "tier": str,        # "strongest" / "favorite" / "combo" / "upset" / "skip" / "pass"
+        "bg": str,          # 背景色
+        "border": str,      # ボーダー色
+        "color": str,       # 文字色
+        "priority": int,    # 0=最強, 5=最弱
+        "description": str, # ツールチップ
+    }
+    """
+    if confidence == "high":
+        if draw_alert:
+            return {
+                "label": "最強",
+                "icon": "🏆",
+                "tier": "strongest",
+                "bg": "#fef3c7",
+                "border": "#f59e0b",
+                "color": "#92400e",
+                "priority": 0,
+                "description": (
+                    "高確信+Draw警戒の組み合わせ。"
+                    "実証正答率 75-80%. 最も信頼できる試合"
+                ),
+            }
+        else:
+            return {
+                "label": "本命",
+                "icon": "🔒",
+                "tier": "favorite",
+                "bg": "#dcfce7",
+                "border": "#86efac",
+                "color": "#15803d",
+                "priority": 1,
+                "description": "高確信の本命試合。確率差が大きく明確な優勢",
+            }
+    elif confidence == "medium":
+        if draw_alert:
+            return {
+                "label": "波乱狙い",
+                "icon": "⚡",
+                "tier": "upset",
+                "bg": "#fefce8",
+                "border": "#fde047",
+                "color": "#a16207",
+                "priority": 2,
+                "description": (
+                    "中確信+Draw警戒。接戦の可能性あり。"
+                    "引き分け含みで慎重に"
+                ),
+            }
+        elif dq_rank in ("A", "B"):
+            return {
+                "label": "組み合わせ",
+                "icon": "🎯",
+                "tier": "combo",
+                "bg": "#eff6ff",
+                "border": "#bfdbfe",
+                "color": "#1d4ed8",
+                "priority": 2,
+                "description": (
+                    "中確信・データ品質良好。第一推奨と第二推奨の"
+                    "組み合わせ賭けに向く"
+                ),
+            }
+        else:  # medium + C/D quality
+            return {
+                "label": "要注意",
+                "icon": "⚠",
+                "tier": "caution",
+                "bg": "#fff7ed",
+                "border": "#fed7aa",
+                "color": "#9a3412",
+                "priority": 3,
+                "description": "中確信だがデータ品質が低い。参考程度に",
+            }
+    else:  # low
+        if draw_alert:
+            return {
+                "label": "スキップ",
+                "icon": "⛔",
+                "tier": "skip",
+                "bg": "#fee2e2",
+                "border": "#fca5a5",
+                "color": "#991b1b",
+                "priority": 5,
+                "description": (
+                    "低確信+Draw警戒。実証正答率10-40%. "
+                    "最も当てにくい組み合わせ。賭け回避推奨"
+                ),
+            }
+        else:
+            return {
+                "label": "見送り",
+                "icon": "⏭",
+                "tier": "pass",
+                "bg": "#f1f5f9",
+                "border": "#cbd5e1",
+                "color": "#64748b",
+                "priority": 4,
+                "description": "低確信の試合。予測根拠が弱いため見送り推奨",
+            }
+
+
 def _build_recommendation(
     confidence: str, dq_rank: str, draw_alert: bool,
     h_pct: int, d_pct: int, a_pct: int,
 ) -> str:
-    """最終推奨バッジを生成。高確信=第一のみ、中/低確信=第一+第二。"""
+    """最終推奨バッジを生成。戦略ラベルと連動。"""
 
     # ── 第一推奨 (argmax) ──
     probs = {"home": h_pct, "draw": d_pct, "away": a_pct}
@@ -1835,23 +1996,13 @@ def _build_recommendation(
 
     first_label = {"home": "ホーム勝ち", "draw": "引き分け", "away": "アウェー勝ち"}[first_cls]
 
-    # ── スタイル決定 ──
-    if confidence == "high":
-        style_icon, style_text = "🔒", "本命向き"
-        style_bg, style_border, style_color = "#dcfce7", "#86efac", "#15803d"
-    elif confidence == "medium":
-        if dq_rank in ("A", "B") and not draw_alert:
-            style_icon, style_text = "🎯", "組み合わせ向き"
-            style_bg, style_border, style_color = "#eff6ff", "#bfdbfe", "#1d4ed8"
-        elif draw_alert:
-            style_icon, style_text = "⚡", "波乱狙い"
-            style_bg, style_border, style_color = "#fefce8", "#fef08a", "#a16207"
-        else:
-            style_icon, style_text = "⏭", "スキップ推奨"
-            style_bg, style_border, style_color = "#f1f5f9", "#cbd5e1", "#64748b"
-    else:  # low
-        style_icon, style_text = "⏭", "見送り推奨"
-        style_bg, style_border, style_color = "#f1f5f9", "#cbd5e1", "#64748b"
+    # 戦略ラベルから style 取得
+    strategy = _get_strategy_label(confidence, draw_alert, dq_rank)
+    style_icon = strategy["icon"]
+    style_text = strategy["label"]
+    style_bg = strategy["bg"]
+    style_border = strategy["border"]
+    style_color = strategy["color"]
 
     # 第一推奨バッジ
     first_html = (
