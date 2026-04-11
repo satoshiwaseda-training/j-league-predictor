@@ -1377,6 +1377,16 @@ def _render_onebutton_results(result: dict, division: str):
     n_mid = sum(1 for p in valid if p["classification"]["confidence_level"] == "medium")
     n_low = sum(1 for p in valid if p["classification"]["confidence_level"] == "low")
     n_draw = sum(1 for p in valid if p["classification"]["draw_alert"])
+    # 内訳: draw警戒と確信度の重複
+    n_high_draw = sum(1 for p in valid
+                      if p["classification"]["confidence_level"] == "high"
+                      and p["classification"]["draw_alert"])
+    n_mid_draw = sum(1 for p in valid
+                     if p["classification"]["confidence_level"] == "medium"
+                     and p["classification"]["draw_alert"])
+    n_low_draw = sum(1 for p in valid
+                     if p["classification"]["confidence_level"] == "low"
+                     and p["classification"]["draw_alert"])
 
     # 直近予測精度 (prediction_store から)
     past_preds = store_load_all()
@@ -1388,14 +1398,30 @@ def _render_onebutton_results(result: dict, division: str):
         acc_text = f"{acc_pct}%"
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("高確信", f"{n_high}試合", help="max_prob >= 50%")
-    c2.metric("中確信", f"{n_mid}試合", help="max_prob 40-50%")
-    c3.metric("低確信", f"{n_low}試合", help="max_prob < 40%")
-    c4.metric("Draw警戒", f"{n_draw}試合", help="draw >= 25% かつ closeness >= 0.5")
+    c1.metric("高確信", f"{n_high}試合",
+              delta=f"Draw警戒 {n_high_draw}" if n_high_draw else None,
+              delta_color="off",
+              help="max_prob >= 50%. Draw警戒は重複カウント")
+    c2.metric("中確信", f"{n_mid}試合",
+              delta=f"Draw警戒 {n_mid_draw}" if n_mid_draw else None,
+              delta_color="off",
+              help="max_prob 40-50%. 0件の場合は fallback動作中の可能性")
+    c3.metric("低確信", f"{n_low}試合",
+              delta=f"Draw警戒 {n_low_draw}" if n_low_draw else None,
+              delta_color="off",
+              help="max_prob < 40%")
+    c4.metric("Draw警戒", f"{n_draw}試合", help="draw >= 25% かつ closeness >= 0.5 (確信度と独立、重複カウント)")
     c5.metric("直近正答率", acc_text or "--",
               delta=f"n={acc_n}" if acc_n else None,
               delta_color="off",
               help="成績記録タブで結果登録後に表示")
+
+    # 中確信0件時の注意文言
+    if n_mid == 0 and (n_high + n_low) > 0:
+        st.caption(
+            "⚠ 中確信0件です。Primary model (hybrid_v9.1) の標準分布では "
+            "中確信は全体の約29%になるはずです。fallback動作中の可能性があります。"
+        )
 
     # ── 今日の注目試合 ──
     _render_spotlight(valid)
