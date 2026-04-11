@@ -1188,20 +1188,45 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 home_days=home_days, away_days=away_days,
                 elo_home_score=elo_h, elo_away_score=elo_a,
             )
-            # v7 predict (baseline/Gemini reasoning生成)
-            v7_prediction = predict_with_gemini(
-                home, away, contributions,
-                home_stats, away_stats,
-                home_form, away_form, h2h, weather,
-                home_xg=home_xg, away_xg=away_xg,
-                home_days=home_days, away_days=away_days,
-                home_cards=home_cards, away_cards=away_cards,
-                home_injuries=home_inj, away_injuries=away_inj,
-            )
             closeness = contributions.get("closeness", 0.5)
 
-            # Primary model selection (hybrid_v9.1 or v7 fallback)
-            # 動的import + getattr で存在しない場合でも安全にfallback
+            # ── 純粋な統計モデル (v7 raw) 確率 — Geminiなし ──
+            # advantage_to_probs() は contributions から純粋な統計確率を返す
+            stat_h, stat_d, stat_a = advantage_to_probs(
+                contributions["raw_home_advantage"], closeness)
+            raw_v7_prediction = {
+                "home_win_prob": stat_h,
+                "draw_prob": stat_d,
+                "away_win_prob": stat_a,
+                "predicted_score": "?-?",
+                "confidence": "medium",
+                "reasoning": "",
+                "model": "v7_refined_raw",
+            }
+
+            # ── Gemini呼び出し (reasoning/説明文のみ取得, 確率は使わない) ──
+            try:
+                gemini_result = predict_with_gemini(
+                    home, away, contributions,
+                    home_stats, away_stats,
+                    home_form, away_form, h2h, weather,
+                    home_xg=home_xg, away_xg=away_xg,
+                    home_days=home_days, away_days=away_days,
+                    home_cards=home_cards, away_cards=away_cards,
+                    home_injuries=home_inj, away_injuries=away_inj,
+                )
+            except Exception:
+                gemini_result = {"reasoning": "", "model": "none"}
+            gemini_used = "gemini" in str(gemini_result.get("model", "")).lower()
+            # Geminiからは reasoning, predicted_score, key_factors, model_notes のみ抽出
+            gemini_reasoning = gemini_result.get("reasoning", "")
+            gemini_score = gemini_result.get("predicted_score", "?-?")
+            gemini_key_factors = gemini_result.get("key_factors", [])
+            gemini_model_notes = gemini_result.get("model_notes", "")
+            gemini_model_tag = gemini_result.get("model", "")
+            gemini_giant_killing = gemini_result.get("giant_killing_prob")
+
+            # Primary model: hybrid_v9.1 (統計モデルのみで確率決定)
             try:
                 import scripts.predict_logic as _pl
                 _primary_ver = getattr(_pl, "PRIMARY_MODEL_VERSION", "v7_refined")
@@ -1214,45 +1239,69 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
 
             if _primary_ver == "hybrid_v9.1" and _compute_hybrid is not None:
                 try:
+                    # raw_v7_prediction (Gemini未介入) を hybrid の入力とする
                     hybrid = _compute_hybrid(
                         home, away, home_stats, away_stats,
                         home_form, away_form,
-                        v7_prediction=v7_prediction,
+                        v7_prediction=raw_v7_prediction,
                         elo_home_score=elo_h, elo_away_score=elo_a,
                         xg_home=home_xg, xg_away=away_xg,
                     )
-                    # Primary = hybrid probs + v7のreasoning/score/confidence
-                    prediction = dict(v7_prediction)
-                    prediction["home_win_prob"] = hybrid["home_win_prob"]
-                    prediction["draw_prob"] = hybrid["draw_prob"]
-                    prediction["away_win_prob"] = hybrid["away_win_prob"]
-                    prediction["hybrid_selection"] = hybrid["selection"]
-                    prediction["skellam_raw"] = hybrid.get("skellam_raw", {})
-                    prediction["skellam_boost"] = hybrid.get("skellam_boost", 0)
-                    prediction["model_version"] = "hybrid_v9.1"
+                    hyb_h = hybrid["home_win_prob"]
+                    hyb_d = hybrid["draw_prob"]
+                    hyb_a = hybrid["away_win_prob"]
+                    hybrid_selection = hybrid["selection"]
+                    skellam_raw = hybrid.get("skellam_raw", {})
+                    skellam_boost = hybrid.get("skellam_boost", 0)
                     primary_version = "hybrid_v9.1"
                 except Exception:
-                    # Fallback to v7 if hybrid fails
-                    prediction = v7_prediction
+                    # fallback: 純粋統計v7
+                    hyb_h, hyb_d, hyb_a = stat_h, stat_d, stat_a
+                    hybrid_selection = "v7_raw"
+                    skellam_raw = {}
+                    skellam_boost = 0
                     primary_version = "v7_refined"
             else:
-                prediction = v7_prediction
+                hyb_h, hyb_d, hyb_a = stat_h, stat_d, stat_a
+                hybrid_selection = "v7_raw"
+                skellam_raw = {}
+                skellam_boost = 0
                 primary_version = "v7_refined"
 
+            # ── 最終prediction: 確率はhybrid_v9.1, 説明文はGemini ──
+            prediction = {
+                "home_win_prob": hyb_h,
+                "draw_prob": hyb_d,
+                "away_win_prob": hyb_a,
+                "predicted_score": gemini_score,
+                "confidence": "medium",  # _classify_predictionで再計算
+                "reasoning": gemini_reasoning,
+                "key_factors": gemini_key_factors,
+                "model_notes": gemini_model_notes,
+                "giant_killing_prob": gemini_giant_killing,
+                "model": (
+                    f"{primary_version}+gemini_reasoning"
+                    if gemini_used else primary_version
+                ),
+                "hybrid_selection": hybrid_selection,
+                "skellam_raw": skellam_raw,
+                "skellam_boost": skellam_boost,
+                "model_version": primary_version,
+            }
+
+            # v7 baseline for comparison (純粋統計v7, Gemini未介入)
+            v7_prediction = dict(raw_v7_prediction)
+            v7_prediction["reasoning"] = gemini_reasoning  # baselineにも同じreasoning
+
             cls = _classify_prediction(prediction, closeness)
-            gemini_used = "gemini" in str(v7_prediction.get("model", "")).lower()
             dq = compute_data_quality(pipeline, home_xg, away_xg, gemini_used)
-            # 統計モデル事前確率 → 補正差分 (v7との差分を表示)
-            stat_h, stat_d, stat_a = advantage_to_probs(
-                contributions["raw_home_advantage"], closeness)
-            # primary vs statの差分
-            gem_diff = None
-            if gemini_used or primary_version == "hybrid_v9.1":
-                gem_diff = {
-                    "home": int(prediction.get("home_win_prob", stat_h)) - stat_h,
-                    "draw": int(prediction.get("draw_prob", stat_d)) - stat_d,
-                    "away": int(prediction.get("away_win_prob", stat_a)) - stat_a,
-                }
+
+            # primary vs stat raw の差分 = hybridによる補正
+            gem_diff = {
+                "home": hyb_h - stat_h,
+                "draw": hyb_d - stat_d,
+                "away": hyb_a - stat_a,
+            } if (hyb_h != stat_h or hyb_d != stat_d or hyb_a != stat_a) else None
             preds.append({
                 "match": match, "prediction": prediction,
                 "home_form": home_form, "away_form": away_form,
