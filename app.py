@@ -1190,8 +1190,7 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             )
             closeness = contributions.get("closeness", 0.5)
 
-            # ── 純粋な統計モデル (v7 raw) 確率 — Geminiなし ──
-            # advantage_to_probs() は contributions から純粋な統計確率を返す
+            # ── Step 1: 純統計v7確率 (Gemini未介入) ──
             stat_h, stat_d, stat_a = advantage_to_probs(
                 contributions["raw_home_advantage"], closeness)
             raw_v7_prediction = {
@@ -1204,42 +1203,21 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 "model": "v7_refined_raw",
             }
 
-            # ── Gemini呼び出し (reasoning/説明文のみ取得, 確率は使わない) ──
-            try:
-                gemini_result = predict_with_gemini(
-                    home, away, contributions,
-                    home_stats, away_stats,
-                    home_form, away_form, h2h, weather,
-                    home_xg=home_xg, away_xg=away_xg,
-                    home_days=home_days, away_days=away_days,
-                    home_cards=home_cards, away_cards=away_cards,
-                    home_injuries=home_inj, away_injuries=away_inj,
-                )
-            except Exception:
-                gemini_result = {"reasoning": "", "model": "none"}
-            gemini_used = "gemini" in str(gemini_result.get("model", "")).lower()
-            # Geminiからは reasoning, predicted_score, key_factors, model_notes のみ抽出
-            gemini_reasoning = gemini_result.get("reasoning", "")
-            gemini_score = gemini_result.get("predicted_score", "?-?")
-            gemini_key_factors = gemini_result.get("key_factors", [])
-            gemini_model_notes = gemini_result.get("model_notes", "")
-            gemini_model_tag = gemini_result.get("model", "")
-            gemini_giant_killing = gemini_result.get("giant_killing_prob")
-
-            # Primary model: hybrid_v9.1 (統計モデルのみで確率決定)
+            # ── Step 2: hybrid_v9.1 で最終確率を決定 (Gemini前) ──
             try:
                 import scripts.predict_logic as _pl
                 _primary_ver = getattr(_pl, "PRIMARY_MODEL_VERSION", "v7_refined")
                 _compute_hybrid = getattr(_pl, "compute_hybrid_v9", None)
                 _compute_shadow = getattr(_pl, "compute_shadow_v8_1", None)
+                _gen_reasoning = getattr(_pl, "generate_reasoning_with_gemini", None)
             except Exception:
                 _primary_ver = "v7_refined"
                 _compute_hybrid = None
                 _compute_shadow = None
+                _gen_reasoning = None
 
             if _primary_ver == "hybrid_v9.1" and _compute_hybrid is not None:
                 try:
-                    # raw_v7_prediction (Gemini未介入) を hybrid の入力とする
                     hybrid = _compute_hybrid(
                         home, away, home_stats, away_stats,
                         home_form, away_form,
@@ -1255,7 +1233,6 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                     skellam_boost = hybrid.get("skellam_boost", 0)
                     primary_version = "hybrid_v9.1"
                 except Exception:
-                    # fallback: 純粋統計v7
                     hyb_h, hyb_d, hyb_a = stat_h, stat_d, stat_a
                     hybrid_selection = "v7_raw"
                     skellam_raw = {}
@@ -1268,7 +1245,52 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 skellam_boost = 0
                 primary_version = "v7_refined"
 
-            # ── 最終prediction: 確率はhybrid_v9.1, 説明文はGemini ──
+            # ── Step 3: Geminiに reasoning のみ生成させる (確率は所与) ──
+            # generate_reasoning_with_gemini は確定済み確率を引数に取り、
+            # それに矛盾しない定性的説明のみを生成する
+            final_probs = {
+                "home_win_prob": hyb_h,
+                "draw_prob": hyb_d,
+                "away_win_prob": hyb_a,
+            }
+            if _gen_reasoning is not None:
+                try:
+                    gemini_result = _gen_reasoning(
+                        home, away, final_probs,
+                        home_stats, away_stats,
+                        home_form, away_form,
+                        h2h, weather,
+                        home_xg=home_xg, away_xg=away_xg,
+                        home_injuries=home_inj, away_injuries=away_inj,
+                        selection=hybrid_selection,
+                    )
+                except Exception:
+                    gemini_result = {
+                        "reasoning": "", "predicted_score": "?-?",
+                        "key_factors": [], "model": "none"
+                    }
+            else:
+                # fallback: 旧関数に引数追加で互換 (確率は無視)
+                try:
+                    gemini_result = predict_with_gemini(
+                        home, away, contributions,
+                        home_stats, away_stats,
+                        home_form, away_form, h2h, weather,
+                        home_xg=home_xg, away_xg=away_xg,
+                        home_days=home_days, away_days=away_days,
+                        home_cards=home_cards, away_cards=away_cards,
+                        home_injuries=home_inj, away_injuries=away_inj,
+                    )
+                except Exception:
+                    gemini_result = {"reasoning": "", "model": "none"}
+
+            gemini_used = "gemini" in str(gemini_result.get("model", "")).lower()
+            gemini_reasoning = gemini_result.get("reasoning", "")
+            gemini_score = gemini_result.get("predicted_score", "?-?")
+            gemini_key_factors = gemini_result.get("key_factors", [])
+            gemini_qual_label = gemini_result.get("qualitative_label", "")
+
+            # ── Step 4: 最終prediction ──
             prediction = {
                 "home_win_prob": hyb_h,
                 "draw_prob": hyb_d,
@@ -1277,8 +1299,7 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 "confidence": "medium",  # _classify_predictionで再計算
                 "reasoning": gemini_reasoning,
                 "key_factors": gemini_key_factors,
-                "model_notes": gemini_model_notes,
-                "giant_killing_prob": gemini_giant_killing,
+                "qualitative_label": gemini_qual_label,
                 "model": (
                     f"{primary_version}+gemini_reasoning"
                     if gemini_used else primary_version
@@ -1289,9 +1310,9 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 "model_version": primary_version,
             }
 
-            # v7 baseline for comparison (純粋統計v7, Gemini未介入)
+            # v7 baseline (純粋統計v7, Gemini未介入)
             v7_prediction = dict(raw_v7_prediction)
-            v7_prediction["reasoning"] = gemini_reasoning  # baselineにも同じreasoning
+            v7_prediction["reasoning"] = gemini_reasoning
 
             cls = _classify_prediction(prediction, closeness)
             dq = compute_data_quality(pipeline, home_xg, away_xg, gemini_used)

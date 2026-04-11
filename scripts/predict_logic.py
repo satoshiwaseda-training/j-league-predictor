@@ -1084,6 +1084,164 @@ def _build_prior_text(contributions: dict, home_team: str, away_team: str) -> st
     )
 
 
+def generate_reasoning_with_gemini(
+    home_team: str,
+    away_team: str,
+    final_probs: dict,
+    home_stats: dict,
+    away_stats: dict,
+    home_form: list[str],
+    away_form: list[str],
+    h2h: dict,
+    weather: dict,
+    home_xg: dict | None = None,
+    away_xg: dict | None = None,
+    home_injuries: list | None = None,
+    away_injuries: list | None = None,
+    selection: str = "",
+) -> dict[str, Any]:
+    """
+    既に決定済みの確率 (hybrid_v9.1 の出力) に対して、
+    Geminiに **定性的な説明文のみ** を生成させる。
+
+    - 独自の確率数値を文中に書かないよう明示的に禁止
+    - UIの正式確率 (final_probs) を参照した記述のみ許可
+    - 基本は「ホーム優勢」「接戦」「引き分け含み」等の定性表現
+
+    Returns
+    -------
+    {
+      "reasoning": str,
+      "predicted_score": str,
+      "key_factors": list[str],
+      "model": str,
+    }
+    """
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key or api_key == "your_gemini_api_key_here":
+        return {
+            "reasoning": "",
+            "predicted_score": "?-?",
+            "key_factors": [],
+            "model": "none",
+        }
+
+    h_pct = int(final_probs.get("home_win_prob", 40))
+    d_pct = int(final_probs.get("draw_prob", 25))
+    a_pct = int(final_probs.get("away_win_prob", 35))
+
+    # 定性ラベル判定
+    mx = max(h_pct, d_pct, a_pct)
+    gap = abs(h_pct - a_pct)
+    if mx >= 55:
+        winner = home_team if h_pct >= a_pct else away_team
+        qual_label = f"{winner}優勢"
+    elif mx >= 45:
+        if d_pct >= 30:
+            qual_label = "接戦・引き分け含み"
+        elif h_pct > a_pct:
+            qual_label = f"{home_team}やや優勢"
+        else:
+            qual_label = f"{away_team}やや優勢"
+    elif d_pct >= 30:
+        qual_label = "拮抗・引き分け含み"
+    else:
+        qual_label = "拮抗・読みにくい"
+
+    home_f_str = " ".join(home_form) if home_form else "不明"
+    away_f_str = " ".join(away_form) if away_form else "不明"
+
+    try:
+        from google import genai
+        from google.genai import types as gtypes
+
+        client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": 120000},
+        )
+
+        prompt = f"""あなたはJリーグ試合分析の専門家です。
+以下の **既に決定済みの確率** に対する **定性的な解説文のみ** を生成してください。
+
+## 試合
+ホーム: {home_team} (順位{home_stats.get('順位','?')}位, 勝点{home_stats.get('勝点','?')})
+アウェー: {away_team} (順位{away_stats.get('順位','?')}位, 勝点{away_stats.get('勝点','?')})
+
+## 既に決定済みの確率 (統計モデル出力, UIに表示されている正式値)
+ホーム勝利: {h_pct}%
+引き分け:   {d_pct}%
+アウェー勝利: {a_pct}%
+→ 定性ラベル: {qual_label}
+
+## 直近フォーム
+{home_team}: {home_f_str}
+{away_team}: {away_f_str}
+
+## H2H (過去{h2h.get('total',0)}試合)
+{home_team} {h2h.get('home_wins',0)}勝 / 引分 {h2h.get('draws',0)} / {away_team} {h2h.get('away_wins',0)}勝
+
+## 天気
+{weather.get('description','?')} 気温{weather.get('temp_avg','?')}°C
+
+## 【重要な制約】
+1. **独自の勝率・確率数値を文中に書かないこと**
+   - NG例: 「ホーム勝率60%と予想」「引き分けは20%程度」
+   - OK例: 「ホーム優勢」「接戦の展開が予想される」「引き分けも十分あり得る」
+2. **確率に言及する場合は上記の正式確率 ({h_pct}%/{d_pct}%/{a_pct}%) のみ引用可**
+   - OK例: 「統計モデルはホーム{h_pct}%と算出しており、...」
+3. **定性表現を基本とする**: 「優勢」「拮抗」「接戦」「引き分け含み」「読みにくい」等
+4. **UIの確率バーと矛盾する説明は禁止**
+   - 定性ラベル「{qual_label}」と整合する分析を行うこと
+
+## 出力形式 (JSON)
+{{
+  "reasoning": "<300字程度の日本語解説。統計モデル出力に矛盾しない定性的分析。
+              チーム状態・フォーム・戦術・H2H等を踏まえる>",
+  "predicted_score": "<X-Y>",
+  "key_factors": ["<要因1>", "<要因2>", "<要因3>"]
+}}
+
+必ず上記JSONのみを返してください。"""
+
+        _chunks: list[str] = []
+        for _chunk in client.models.generate_content_stream(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=gtypes.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.3,
+                max_output_tokens=1024,
+                thinking_config=gtypes.ThinkingConfig(thinking_budget=0),
+            ),
+        ):
+            if _chunk.text:
+                _chunks.append(_chunk.text)
+        raw = "".join(_chunks).strip()
+        if "```" in raw:
+            raw = raw.split("```")[1].lstrip("json").strip().split("```")[0]
+
+        result = json.loads(raw)
+        return {
+            "reasoning": result.get("reasoning", ""),
+            "predicted_score": result.get("predicted_score", "?-?"),
+            "key_factors": result.get("key_factors", []),
+            "model": "gemini-2.5-flash",
+            "qualitative_label": qual_label,
+        }
+    except Exception as exc:
+        logger.error("Gemini reasoning error: %s", exc)
+        return {
+            "reasoning": (
+                f"統計モデルは{qual_label}と判定しています。"
+                f"ホーム{h_pct}% / 引分{d_pct}% / アウェー{a_pct}%。"
+            ),
+            "predicted_score": "?-?",
+            "key_factors": [],
+            "model": "fallback",
+            "qualitative_label": qual_label,
+        }
+
+
 def predict_with_gemini(
     home_team: str,
     away_team: str,
