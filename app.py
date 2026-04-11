@@ -981,30 +981,51 @@ def _classify_prediction(pred: dict, closeness: float = 0.5) -> dict:
     """
     予測の確信度とdraw警戒を判定。
 
-    確信度閾値 (hybrid_v9.1 の max_prob 分布に合わせ調整済み):
-    - high: max_prob >= 47 (約31%の試合)
-    - medium: 37 <= max_prob < 47 (約40%の試合)
-    - low: max_prob < 37 (約30%の試合)
+    確信度は top1 - top2 の差分ベース (3クラス分類に即した尺度):
+    - high: diff >= 15 (1位が2位を15pp以上引き離す → 確信的)
+    - medium: 5 <= diff < 15 (やや優勢)
+    - low: diff < 5 (拮抗)
 
-    旧閾値 (50/40) では hybrid_v9.1 の 2極化出力 (大多数が34-39%か50%+)
-    により medium がほぼ0になる問題を修正。
+    2025全377試合での分布:
+    - high 33% / medium 28% / low 39%
+
+    max_prob ベースから差分ベースに変更した理由:
+    - 3クラス分類では「1位と2位の差」が確信度の実態を反映
+    - hybrid_v9.1 の 2極化出力 (34-39% or 50%+) に対しても
+      「接戦 vs 一方的」の区別が明確にできる
+    - 例: H=34/D=33/A=33 (max=34) と H=63/D=21/A=16 (max=63) の
+          両方を区別可能だった旧方式と等価性を保ちつつ、
+          H=40/D=35/A=25 のような「弱い優勢」を medium として捉えられる
 
     draw_alert は confidence_level と独立:
-    draw警戒試合でも medium/high/low のいずれかに確実にカウントされる。
+    draw警戒試合でも high/medium/low のいずれかに確実にカウントされる。
     """
     h = int(pred.get("home_win_prob", 40))
     d = int(pred.get("draw_prob", 25))
     a = int(pred.get("away_win_prob", 35))
-    mx = max(h, d, a)
-    if mx >= 47:
+    # top1 - top2 の差分
+    probs = sorted([h, d, a], reverse=True)
+    top1 = probs[0]
+    top2 = probs[1]
+    diff = top1 - top2
+    mx = top1  # 下位互換のため残す
+
+    if diff >= 15:
         confidence_level = "high"
-    elif mx >= 37:
+    elif diff >= 5:
         confidence_level = "medium"
     else:
         confidence_level = "low"
     draw_alert = d >= 25 and closeness >= 0.5
-    return {"confidence_level": confidence_level, "draw_alert": draw_alert,
-            "max_prob": mx, "closeness": closeness}
+    return {
+        "confidence_level": confidence_level,
+        "draw_alert": draw_alert,
+        "max_prob": mx,
+        "top1": top1,
+        "top2": top2,
+        "diff": diff,
+        "closeness": closeness,
+    }
 
 
 def _render_spotlight(valid_preds: list[dict]):
@@ -1484,15 +1505,15 @@ def _render_onebutton_results(result: dict, division: str):
     c1.metric("高確信", f"{n_high}試合",
               delta=f"Draw警戒 {n_high_draw}" if n_high_draw else None,
               delta_color="off",
-              help="max_prob >= 47%. Draw警戒は独立軸で重複カウント")
+              help="top1-top2 差が15pp以上 (1位が2位を明確に引き離す)")
     c2.metric("中確信", f"{n_mid}試合",
               delta=f"Draw警戒 {n_mid_draw}" if n_mid_draw else None,
               delta_color="off",
-              help="max_prob 37-47%. Draw警戒は独立軸で重複カウント")
+              help="top1-top2 差が5-15pp (やや優勢)")
     c3.metric("低確信", f"{n_low}試合",
               delta=f"Draw警戒 {n_low_draw}" if n_low_draw else None,
               delta_color="off",
-              help="max_prob < 37%")
+              help="top1-top2 差が5pp未満 (拮抗)")
     c4.metric("Draw警戒", f"{n_draw}試合",
               help="draw >= 25% かつ closeness >= 0.5 (確信度と独立、重複カウント)")
     c5.metric("直近正答率", acc_text or "--",
