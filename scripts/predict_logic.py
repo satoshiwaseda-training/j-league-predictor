@@ -817,6 +817,89 @@ def calculate_parameter_contributions(
     }
 
 
+# ─── 環境ベースのドロー補正 ────────────────────────────────
+
+def compute_fan_pressure(
+    attendance_fill_rate: float | None,
+    core_support_proxy: float | None,
+    away_fan_access_penalty: float | None,
+) -> float:
+    """
+    ファン圧力スコア: ホームの雰囲気的優勢度。
+
+    = 0.4 * fill_rate + 0.3 * core_support - 0.5 * away_fan_access_penalty
+    高い → ホーム後押しが強い (advantage を押し上げる)
+
+    根拠: Buraimo et al. (2010), Ponzo & Scoppa (2018)
+      - 入場率 10%上昇 → ホーム勝率 +2-3pp
+      - アウェイファン動員難 → 審判ジャッジにホームバイアス増加
+    """
+    fill = attendance_fill_rate if attendance_fill_rate is not None else 0.5
+    core = core_support_proxy if core_support_proxy is not None else 0.3
+    away_pen = away_fan_access_penalty if away_fan_access_penalty is not None else 0.15
+
+    score = 0.4 * fill + 0.3 * core - 0.5 * away_pen
+    return round(max(-0.5, min(1.0, score)), 4)
+
+
+def compute_away_fatigue(
+    travel_distance_km: float | None,
+    days_rest_away: int | None,
+    long_trip_flag: bool | None,
+) -> float:
+    """
+    アウェイ疲労スコア: 移動 + 休養不足の複合効果。
+
+    = 0.4 * norm(distance) + 0.3 * norm(1/rest) + 0.3 * long_trip
+    高い → アウェイが不利 (advantage を押し上げる)
+
+    根拠: Drust et al. (2012), Lago-Peñas (2012)
+      - 600km+移動 → パフォーマンス -3〜5%
+      - 中3日以内 → 高速走行距離 -8% (BJSM)
+    """
+    # 距離正規化 (0=0km, 1=1500km+)
+    dist = travel_distance_km if travel_distance_km is not None else 0.0
+    norm_dist = min(dist / 1500.0, 1.0)
+
+    # 休養逆数正規化 (rest=7 → 0.14, rest=2 → 0.5, rest=1 → 1.0)
+    rest = days_rest_away if days_rest_away is not None and days_rest_away > 0 else 7
+    norm_rest_inv = min(1.0 / rest, 1.0)
+
+    # long trip flag
+    long_f = 1.0 if long_trip_flag else 0.0
+
+    score = 0.4 * norm_dist + 0.3 * norm_rest_inv + 0.3 * long_f
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def compute_draw_environment_score(features: dict | None) -> float:
+    """
+    環境特徴量からドロー確率を押し上げるスコアを算出。
+
+    根拠:
+      - WBGT危険 × 連戦 → 両チーム体力低下で拮抗 (Mohr et al. 2010)
+      - 雨 × ピッチ不良 → 技術差が出にくい (Thomas et al. 2006)
+      - 高温多湿 × 長距離遠征 → アウェイ不利が緩和されにくく硬直
+
+    Returns: 0.0〜3.7 (理論上限、通常は 0〜2 程度)
+    """
+    if not features:
+        return 0.0
+
+    def _flag(key: str) -> float:
+        v = features.get(key)
+        if v is True or v == 1 or v == 1.0:
+            return 1.0
+        return 0.0
+
+    score = (
+        1.5 * _flag("wbgt_danger_flag") * _flag("congested_schedule_flag")
+        + 1.2 * _flag("rain_flag") * _flag("pitch_condition_bad_flag")
+        + 1.0 * _flag("hot_humid_flag") * _flag("away_long_trip_flag")
+    )
+    return round(score, 4)
+
+
 # ─── 確率変換 ────────────────────────────────────────────
 
 def _softmax3(lh: float, ld: float, la: float) -> tuple[float, float, float]:
@@ -853,6 +936,13 @@ def advantage_to_probs(
     raw_advantage: float,
     closeness: float = 0.5,
     mode: str = "3logit",
+    draw_env_score: float = 0.0,
+    elo_gap: float = 0.0,
+    fan_pressure: float = 0.0,
+    away_fatigue: float = 0.0,
+    fan_coeff: float = 0.08,
+    away_fatigue_conditional: bool = False,
+    away_fatigue_to_draw: float = 0.0,
 ) -> tuple[int, int, int]:
     """
     raw_advantage (-1〜+1) + closeness (0〜1) → (home_win%, draw%, away_win%)
@@ -861,35 +951,66 @@ def advantage_to_probs(
     ----------
     raw_advantage : 重み付き特徴量のホーム優勢度 (正=ホーム有利)
     closeness : 実力接近度 (1.0=完全均衡, 0.0=一方的差)
-                calculate_parameter_contributions() の戻り値に含まれる
-    mode : "3logit" (新方式) or "legacy" (旧シグモイド方式)
+    mode : "3logit" | "v8.1" | "legacy"
+    draw_env_score : 環境要因によるドロー確率の押し上げ量 (0〜3.7)
+    elo_gap : |ELO期待勝率差| (0〜1)
+    fan_pressure : ファン圧力スコア (正=ホーム後押し)
+    away_fatigue : アウェイ疲労スコア (0〜1)
+    fan_coeff : fan_pressure の advantage 加算係数 (デフォルト 0.08)
+    away_fatigue_conditional : True ならば away_fatigue は advantage に加算しない
+        (条件付き発火は呼び出し側で制御し、away_fatigue=0 を渡す)
+    away_fatigue_to_draw : away_fatigue の draw logit への加算係数
+        (away疲労 → 両チーム膠着 → draw 上昇として使う場合)
 
-    3ロジット方式:
-      logit_home = scale_ha * raw_adv + bias_home
-      logit_away = -scale_ha * raw_adv + bias_away
-      logit_draw = scale_draw * closeness + bias_draw
-      → softmax([logit_home, logit_draw, logit_away])
-
-    drawに独立したロジットを持たせることで、
-    実力接近時にdrawがargmaxで選ばれることが可能。
+    補正式:
+      advantage_adjusted = raw_adv + fan_coeff * fan_pressure
+                         + (0 if conditional else 0.08 * away_fatigue)
+      draw_logit += 0.15 * draw_env_score + away_fatigue_to_draw * away_fatigue
     """
     if mode == "legacy":
         return _legacy_advantage_to_probs(raw_advantage)
 
-    # mode="v8.1": shadow model
     if mode == "v8.1":
         p = V8_1_3LOGIT_PARAMS
     else:
         p = _3LOGIT_PARAMS
-    logit_h = p["scale_ha"] * raw_advantage + p["bias_home"]
-    logit_a = -p["scale_ha"] * raw_advantage + p["bias_away"]
-    logit_d = p["scale_draw"] * closeness + p["bias_draw"]
+
+    # ファン圧力は常時加算、アウェイ疲労は条件付き
+    advantage_adjusted = raw_advantage + fan_coeff * fan_pressure
+    if not away_fatigue_conditional:
+        advantage_adjusted += 0.08 * away_fatigue
+
+    # 環境補正付き closeness
+    effective_closeness = closeness + 0.08 * draw_env_score - 0.2 * abs(elo_gap)
+    effective_closeness = max(0.0, min(1.0, effective_closeness))
+
+    logit_h = p["scale_ha"] * advantage_adjusted + p["bias_home"]
+    logit_a = -p["scale_ha"] * advantage_adjusted + p["bias_away"]
+    logit_d = (p["scale_draw"] * effective_closeness + p["bias_draw"]
+               + 0.15 * draw_env_score
+               + away_fatigue_to_draw * away_fatigue)
 
     h, d, a = _softmax3(logit_h, logit_d, logit_a)
 
     h_pct = round(h * 100)
     a_pct = round(a * 100)
     d_pct = 100 - h_pct - a_pct
+
+    # draw下限保証: 環境補正後の接近度が高い場合、最低22%を保証
+    _DRAW_FLOOR_CLOSENESS = 0.55
+    _DRAW_FLOOR_PCT = 22
+    if effective_closeness > _DRAW_FLOOR_CLOSENESS and d_pct < _DRAW_FLOOR_PCT:
+        deficit = _DRAW_FLOOR_PCT - d_pct
+        d_pct = _DRAW_FLOOR_PCT
+        # H/A から均等に削る
+        if h_pct >= a_pct:
+            h_pct -= deficit
+        else:
+            a_pct -= deficit
+        # 合計100%に再調整
+        total = h_pct + d_pct + a_pct
+        if total != 100:
+            h_pct += 100 - total
 
     return h_pct, d_pct, a_pct
 

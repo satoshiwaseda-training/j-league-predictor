@@ -29,6 +29,9 @@ from scripts.predict_logic import (
     predict_with_gemini,
     MODEL_WEIGHTS,
     _TEAM_CAPITAL_SCORES, _DEFAULT_CAPITAL_SCORE,
+    compute_draw_environment_score,
+    compute_fan_pressure,
+    compute_away_fatigue,
 )
 from prediction_store import (
     load_all as store_load_all,
@@ -36,6 +39,19 @@ from prediction_store import (
     update_actual as store_update_actual,
     delete_prediction as store_delete,
     get_accuracy_stats,
+)
+from weekend_update import (
+    run_weekend_update,
+    get_weekend_range,
+    update_team_state_after_results,
+    load_history as wu_load_history,
+    rebuild_post_result_features,
+)
+from weekend_review import (
+    run_weekend_review,
+    evaluate_weekend_predictions,
+    build_weekend_review_table,
+    summarize_weekend_review,
 )
 try:
     from scripts.feedback_loop import (
@@ -1224,9 +1240,53 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             )
             closeness = contributions.get("closeness", 0.5)
 
+            # ── 環境 + fan/travel 補正 ──
+            _env_features = _build_env_features_for_match(
+                match, contributions, weather,
+                elo_h, elo_a,
+            )
+            _draw_env = compute_draw_environment_score(_env_features)
+            _elo_gap = abs((elo_h or 0.5) - (elo_a or 0.5))
+            _fan_p = compute_fan_pressure(
+                _env_features.get("attendance_fill_rate"),
+                _env_features.get("club_core_support_proxy"),
+                _env_features.get("away_fan_access_penalty"),
+            )
+            _away_f = compute_away_fatigue(
+                _env_features.get("away_travel_distance_km"),
+                _env_features.get("days_rest_away"),
+                _env_features.get("away_long_trip_flag"),
+            )
+            # travel条件付き: long_trip かつ 中3日以内のみ advantage に反映
+            _long = _env_features.get("away_long_trip_flag", False)
+            _rest = _env_features.get("days_rest_away")
+            _travel_cond = _long and (_rest is not None and _rest <= 3)
+            _away_f_adv = _away_f if _travel_cond else 0.0
+
+            # ── 補正前の確率 (監視用) ──
+            _pre_h, _pre_d, _pre_a = advantage_to_probs(
+                contributions["raw_home_advantage"], closeness,
+                draw_env_score=_draw_env, elo_gap=_elo_gap)
+
             # ── Step 1: 純統計v7確率 (Gemini未介入) ──
             stat_h, stat_d, stat_a = advantage_to_probs(
-                contributions["raw_home_advantage"], closeness)
+                contributions["raw_home_advantage"], closeness,
+                draw_env_score=_draw_env, elo_gap=_elo_gap,
+                fan_pressure=_fan_p, away_fatigue=_away_f_adv,
+                away_fatigue_conditional=True)
+
+            # ── 補正監視データ ──
+            _pre_winner = "home" if _pre_h >= _pre_d and _pre_h >= _pre_a else ("draw" if _pre_d >= _pre_a else "away")
+            _post_winner = "home" if stat_h >= stat_d and stat_h >= stat_a else ("draw" if stat_d >= stat_a else "away")
+            _adjustments = {
+                "fan_applied": abs(_fan_p) > 0.001,
+                "travel_applied": _travel_cond,
+                "fan_value": round(_fan_p, 4),
+                "travel_value": round(_away_f_adv, 4),
+                "pre_h": _pre_h, "pre_d": _pre_d, "pre_a": _pre_a,
+                "post_h": stat_h, "post_d": stat_d, "post_a": stat_a,
+                "argmax_changed": _pre_winner != _post_winner,
+            }
             raw_v7_prediction = {
                 "home_win_prob": stat_h,
                 "draw_prob": stat_d,
@@ -1389,9 +1449,9 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                     baseline_prediction=v7_prediction,
                     model_version=primary_version,
                     baseline_model_version="v7_refined",
+                    adjustments=_adjustments,
                 )
             except TypeError:
-                # 古いstore_save (baseline_prediction非対応) の場合
                 try:
                     store_save(
                         division, match, prediction,
@@ -1399,7 +1459,6 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                         model_version=primary_version,
                     )
                 except TypeError:
-                    # 最古バージョン対応
                     store_save(division, match, prediction)
         except Exception as exc:
             import traceback as _tb
@@ -2368,9 +2427,32 @@ def run_season_backtest(division: str) -> tuple[int, int]:
             )
 
             # 統計モデルで確率算出（高速・再現性重視）
+            _env_f = _build_env_features_for_match(
+                m, contributions, weather,
+                elo_h, elo_a,
+            )
+            _de = compute_draw_environment_score(_env_f)
+            _eg = abs((elo_h or 0.5) - (elo_a or 0.5))
+            _fp = compute_fan_pressure(
+                _env_f.get("attendance_fill_rate"),
+                _env_f.get("club_core_support_proxy"),
+                _env_f.get("away_fan_access_penalty"),
+            )
+            _af = compute_away_fatigue(
+                _env_f.get("away_travel_distance_km"),
+                _env_f.get("days_rest_away"),
+                _env_f.get("away_long_trip_flag"),
+            )
+            _lg = _env_f.get("away_long_trip_flag", False)
+            _rs = _env_f.get("days_rest_away")
+            _tc = _lg and (_rs is not None and _rs <= 3)
+            _af_adv = _af if _tc else 0.0
             h_pct, d_pct, a_pct = advantage_to_probs(
                 contributions["raw_home_advantage"],
                 contributions.get("closeness", 0.5),
+                draw_env_score=_de, elo_gap=_eg,
+                fan_pressure=_fp, away_fatigue=_af_adv,
+                away_fatigue_conditional=True,
             )
 
             if h_pct >= a_pct and h_pct >= d_pct:
@@ -2916,6 +2998,453 @@ def render_about():
         st.error(f"使い方ページの表示中にエラー: {exc}")
 
 
+# ─── 週末レビュー ─────────────────────────────────────────
+
+def _build_env_features_for_match(
+    match: dict,
+    contributions: dict,
+    weather: dict,
+    elo_h: float | None = None,
+    elo_a: float | None = None,
+) -> dict:
+    """
+    予測パイプライン中で環境ドロー補正 + fan/travel 補正に必要な特徴量を軽量構築。
+    environment_fetch を呼ばず、既に取得済みのデータから構成する。
+    """
+    features = {}
+
+    # 天候ベース
+    fatigue = weather.get("fatigue_factor", 0) if weather else 0
+    temp = weather.get("temp_avg", None) if weather else None
+    precip = weather.get("precipitation", 0) if weather else 0
+
+    # rain_flag
+    features["rain_flag"] = precip >= 1.0 if precip is not None else False
+
+    # hot_humid_flag
+    features["hot_humid_flag"] = temp is not None and temp >= 28
+
+    # wbgt_danger_flag
+    features["wbgt_danger_flag"] = fatigue >= 0.35
+
+    # pitch_condition_bad_flag
+    features["pitch_condition_bad_flag"] = precip >= 10.0 if precip is not None else False
+
+    # away_long_trip_flag
+    dist = contributions.get("distance_km", 0) or 0
+    features["away_long_trip_flag"] = dist >= 600
+
+    # congested_schedule_flag
+    home_days = contributions.get("home_days", 0)
+    away_days = contributions.get("away_days", 0)
+    features["congested_schedule_flag"] = (
+        (home_days > 0 and home_days <= 3) or (away_days > 0 and away_days <= 3)
+    )
+
+    # ── fan/travel 特徴量 ──
+    home_team = match.get("home", "")
+    away_team = match.get("away", "")
+
+    # ファン圧力要素
+    from fan_travel_features import (
+        _CLUB_FANBASE_PROXY, _DEFAULT_FANBASE,
+        _CLUB_CORE_SUPPORT, _DEFAULT_CORE_SUPPORT,
+        is_derby,
+        _compute_weekday_penalty, _compute_late_kickoff_penalty,
+        _compute_fan_access_penalty, _parse_kickoff_hour,
+    )
+    from venues import get_venue_info
+
+    home_venue = get_venue_info(home_team)
+    capacity = home_venue.get("capacity", 0)
+
+    # attendance_fill_rate (予測時は過去平均からの推定 → fanbase proxy で代替)
+    fanbase = _CLUB_FANBASE_PROXY.get(home_team, _DEFAULT_FANBASE)
+    features["attendance_fill_rate"] = fanbase * 0.75  # proxy → fill_rate 近似
+
+    # core_support_proxy
+    features["club_core_support_proxy"] = _CLUB_CORE_SUPPORT.get(home_team, _DEFAULT_CORE_SUPPORT)
+
+    # away_fan_access_penalty
+    weekday_pen = _compute_weekday_penalty(match.get("date", ""))
+    kh = _parse_kickoff_hour(match.get("time", ""))
+    late_pen = _compute_late_kickoff_penalty(kh, dist)
+    derby_flag = is_derby(home_team, away_team)
+    features["away_fan_access_penalty"] = _compute_fan_access_penalty(
+        dist, weekday_pen, late_pen, derby_flag,
+    )
+
+    # アウェイ疲労要素
+    features["away_travel_distance_km"] = dist
+    features["days_rest_away"] = away_days if away_days > 0 else None
+
+    return features
+
+
+def render_weekend_review(division: str):
+    """今週末の結果取り込み・レビュー・次節状態更新タブ"""
+    try:
+        st.markdown("### 📅 今週末レビュー")
+        st.caption("今週末の終了済み試合を取り込み、予測との差分を分析します。")
+
+        # 週末の日付範囲を表示
+        start, end = get_weekend_range()
+        st.info(f"対象期間: **{start.isoformat()}** 〜 **{end.isoformat()}**（直近の土日）")
+
+        # オプション
+        with st.expander("詳細オプション", expanded=False):
+            col_opt1, col_opt2 = st.columns(2)
+            with col_opt1:
+                include_friday = st.checkbox("金曜開催を含める", value=False)
+                include_monday = st.checkbox("月曜開催を含める", value=False)
+            with col_opt2:
+                target_divs = st.multiselect(
+                    "対象リーグ",
+                    ["j1", "j2"],
+                    default=["j1", "j2"] if division in ("j1", "j2") else [division],
+                )
+
+        # ── ボタン群 ──
+        btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+        with btn_col1:
+            btn_fetch = st.button(
+                "1. 今週末結果を取得して履歴更新",
+                type="primary",
+                use_container_width=True,
+            )
+        with btn_col2:
+            btn_review = st.button(
+                "2. 今週末レビューを生成",
+                use_container_width=True,
+            )
+        with btn_col3:
+            btn_state = st.button(
+                "3. 次節向け状態を再計算",
+                use_container_width=True,
+            )
+
+        # ── 1. 結果取得 & 履歴更新 ──
+        if btn_fetch:
+            with st.spinner("今週末の結果を取得中..."):
+                update_result = run_weekend_update(
+                    divisions=target_divs if target_divs else None,
+                    extend_friday=include_friday,
+                    extend_monday=include_monday,
+                )
+
+            results_df = update_result["results_df"]
+            merge = update_result["merge_stats"]
+            sync = update_result["store_sync"]
+            errors = update_result["errors"]
+            wk_start, wk_end = update_result["weekend_range"]
+
+            # サマリーメトリクス
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("取得試合数", len(results_df))
+            m2.metric("新規反映", merge.get("new_count", 0))
+            m3.metric("重複スキップ", merge.get("duplicate_count", 0))
+            m4.metric("予測ストア更新", sync.get("updated", 0))
+
+            if merge.get("updated_count", 0) > 0:
+                st.success(f"ステータス更新: {merge['updated_count']}件")
+
+            if merge.get("warnings"):
+                for w in merge["warnings"]:
+                    st.warning(w)
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+
+            # 取得結果一覧
+            if not results_df.empty:
+                st.markdown("#### 取得した試合結果")
+                display_df = results_df[["date", "competition", "home_team", "away_team",
+                                         "home_score", "away_score", "result"]].copy()
+                display_df.columns = ["日付", "リーグ", "ホーム", "アウェイ", "H得点", "A得点", "結果"]
+                st.dataframe(display_df, hide_index=True, use_container_width=True)
+            else:
+                st.info("対象期間に終了済み試合がありません。")
+
+            # セッションに保存
+            st.session_state["weekend_results_df"] = results_df
+
+            with st.expander("取得ログ", expanded=False):
+                st.json({
+                    "期間": f"{wk_start.isoformat()} 〜 {wk_end.isoformat()}",
+                    "取得数": len(results_df),
+                    "マージ": {k: v for k, v in merge.items() if k != "merged_df"},
+                    "ストア同期": sync,
+                    "エラー": errors,
+                })
+
+        # ── 2. 週末レビュー生成 ──
+        if btn_review:
+            results_df = st.session_state.get("weekend_results_df")
+            if results_df is None or (isinstance(results_df, pd.DataFrame) and results_df.empty):
+                st.warning("先に「1. 今週末結果を取得して履歴更新」を実行してください。")
+            else:
+                with st.spinner("レビューを生成中..."):
+                    review = run_weekend_review(results_df)
+
+                evaluations = review["evaluations"]
+                review_table = review["review_table"]
+                summary = review["summary"]
+
+                st.session_state["weekend_review"] = review
+
+                # ── サマリー表示 ──
+                if summary.get("total", 0) > 0:
+                    st.markdown("#### 週末レビュー サマリー")
+
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("対象試合数", summary.get("total", 0))
+                    s2.metric(
+                        "的中率",
+                        f"{summary['accuracy_pct']}%" if summary.get("accuracy_pct") is not None else "—",
+                    )
+                    s3.metric("平均Brier", f"{summary['avg_brier']:.4f}" if summary.get("avg_brier") is not None else "—")
+                    s4.metric("平均LogLoss", f"{summary['avg_logloss']:.4f}" if summary.get("avg_logloss") is not None else "—")
+
+                    s5, s6, s7, s8 = st.columns(4)
+                    s5.metric("予測あり", summary.get("with_prediction", 0))
+                    s6.metric("ドロー(実)", summary.get("draw_total", 0))
+                    s7.metric("ドロー的中", summary.get("draw_correct", 0))
+                    s8.metric("波乱", summary.get("upset_count", 0))
+
+                    # ── 高確信外し ──
+                    hcm = summary.get("high_conf_misses", [])
+                    if hcm:
+                        st.markdown("##### 高確信で外した試合")
+                        for m in hcm:
+                            st.markdown(
+                                f'<div style="background:#fef2f2;border:1px solid #fca5a5;'
+                                f'border-radius:8px;padding:0.6rem 1rem;margin-bottom:0.4rem;">'
+                                f'<strong>{m["match"]}</strong> → {m["score"]} '
+                                f'(予測: {m.get("pred_winner","?")} / max={m.get("max_prob","?")}%)'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    # ── 波乱一覧 ──
+                    upsets = summary.get("upsets", [])
+                    if upsets:
+                        st.markdown("##### 大波乱試合")
+                        for u in upsets:
+                            st.markdown(
+                                f'<div style="background:#fffbeb;border:1px solid #fcd34d;'
+                                f'border-radius:8px;padding:0.6rem 1rem;margin-bottom:0.4rem;">'
+                                f'<strong>{u["match"]}</strong> → {u["score"]} '
+                                f'(max予測確率: {u.get("max_prob","?")}%)'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    # ── 低確信的中 ──
+                    lch = summary.get("low_conf_hits", [])
+                    if lch:
+                        st.markdown("##### 低確信で的中した試合")
+                        for h in lch:
+                            st.markdown(
+                                f'<div style="background:#f0fdf4;border:1px solid #86efac;'
+                                f'border-radius:8px;padding:0.6rem 1rem;margin-bottom:0.4rem;">'
+                                f'<strong>{h["match"]}</strong> → {h["score"]} '
+                                f'(max予測確率: {h.get("max_prob","?")}%)'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    # ── 最も大きく外した / 評価しやすかった試合 ──
+                    wm_col, bh_col = st.columns(2)
+                    with wm_col:
+                        wm = summary.get("worst_miss")
+                        if wm:
+                            st.markdown("##### 最も大きく外した試合")
+                            st.markdown(
+                                f'<div style="background:#fef2f2;border-radius:8px;padding:0.8rem;'
+                                f'border:1px solid #fca5a5;">'
+                                f'<strong>{wm["match"]}</strong><br>'
+                                f'スコア: {wm["score"]} / Brier: {wm.get("brier","?")} / max: {wm.get("max_prob","?")}%'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                    with bh_col:
+                        bh = summary.get("best_hit")
+                        if bh:
+                            st.markdown("##### 最も評価しやすかった試合")
+                            st.markdown(
+                                f'<div style="background:#f0fdf4;border-radius:8px;padding:0.8rem;'
+                                f'border:1px solid #86efac;">'
+                                f'<strong>{bh["match"]}</strong><br>'
+                                f'スコア: {bh["score"]} / Brier: {bh.get("brier","?")} / max: {bh.get("max_prob","?")}%'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                    # ── 品質ランク別成績 ──
+                    qs = summary.get("quality_stats", {})
+                    if qs:
+                        st.markdown("##### 品質ランク別成績")
+                        qs_rows = []
+                        for rank in ["A", "B", "C", "D"]:
+                            if rank in qs:
+                                q = qs[rank]
+                                qs_rows.append({
+                                    "ランク": rank,
+                                    "試合数": q["total"],
+                                    "的中": q["correct"],
+                                    "正答率": f"{q['accuracy']*100:.1f}%" if q.get("accuracy") is not None else "—",
+                                })
+                        if qs_rows:
+                            st.dataframe(pd.DataFrame(qs_rows), hide_index=True, use_container_width=True)
+
+                    # ── モデルの癖分析 ──
+                    bias = summary.get("bias_analysis", {})
+                    if bias:
+                        st.markdown("##### モデルの癖分析")
+                        bias_warns = bias.get("warnings", [])
+                        if bias_warns:
+                            for bw in bias_warns:
+                                st.warning(bw)
+                        else:
+                            st.success("顕著なバイアスは検出されませんでした。")
+
+                        bias_cols = st.columns(3)
+                        with bias_cols[0]:
+                            st.markdown(f"**ホーム** 予測率: {bias.get('home_pred_rate',0)*100:.1f}% / 実際: {bias.get('home_actual_rate',0)*100:.1f}%")
+                        with bias_cols[1]:
+                            st.markdown(f"**ドロー** 予測率: {bias.get('draw_pred_rate',0)*100:.1f}% / 実際: {bias.get('draw_actual_rate',0)*100:.1f}%")
+                        with bias_cols[2]:
+                            st.markdown(f"**アウェイ** 予測率: {bias.get('away_pred_rate',0)*100:.1f}% / 実際: {bias.get('away_actual_rate',0)*100:.1f}%")
+
+                    # ── Gemini 補正効果 ──
+                    g_acc = summary.get("gemini_accuracy")
+                    ng_acc = summary.get("non_gemini_accuracy")
+                    if g_acc is not None or ng_acc is not None:
+                        st.markdown("##### Gemini補正効果")
+                        gc1, gc2 = st.columns(2)
+                        with gc1:
+                            st.metric("Gemini使用時 正答率",
+                                      f"{g_acc*100:.1f}%" if g_acc is not None else "—")
+                        with gc2:
+                            st.metric("Geminiなし 正答率",
+                                      f"{ng_acc*100:.1f}%" if ng_acc is not None else "—")
+
+                # ── fan/travel 補正監視 ──
+                adj_stats = summary.get("adjustment_stats", {})
+                if adj_stats.get("fan_applied_count", 0) > 0 or adj_stats.get("travel_applied_count", 0) > 0:
+                    st.markdown("##### fan/travel 補正効果")
+                    adj_c1, adj_c2, adj_c3 = st.columns(3)
+                    adj_c1.metric("Fan補正適用", f"{adj_stats.get('fan_applied_count', 0)}試合")
+                    adj_c2.metric("Travel発火", f"{adj_stats.get('travel_applied_count', 0)}試合")
+                    adj_c3.metric("ラベル変化", f"{adj_stats.get('argmax_changed_count', 0)}試合")
+
+                    # Fan補正あり vs なしの比較
+                    fm = adj_stats.get("fan_applied_metrics", {})
+                    fnm = adj_stats.get("fan_not_applied_metrics", {})
+                    if fm.get("n", 0) > 0 and fnm.get("n", 0) > 0:
+                        fan_c1, fan_c2 = st.columns(2)
+                        with fan_c1:
+                            st.markdown("**Fan補正あり**")
+                            st.markdown(
+                                f"N={fm['n']}, Acc={fm['accuracy']*100:.1f}%, "
+                                f"Brier={fm['avg_brier']}, LL={fm['avg_logloss']}"
+                                if fm.get("accuracy") is not None else f"N={fm['n']}"
+                            )
+                        with fan_c2:
+                            st.markdown("**Fan補正なし**")
+                            st.markdown(
+                                f"N={fnm['n']}, Acc={fnm['accuracy']*100:.1f}%, "
+                                f"Brier={fnm['avg_brier']}, LL={fnm['avg_logloss']}"
+                                if fnm.get("accuracy") is not None else f"N={fnm['n']}"
+                            )
+
+                    # ラベル変化した試合一覧
+                    changed = adj_stats.get("argmax_changed_matches", [])
+                    if changed:
+                        st.markdown("**補正でラベルが変わった試合:**")
+                        for cm in changed:
+                            icon = "O" if cm.get("correct") else "X"
+                            st.markdown(
+                                f'<div style="background:#eff6ff;border:1px solid #93c5fd;'
+                                f'border-radius:8px;padding:0.5rem 1rem;margin-bottom:0.3rem;">'
+                                f'[{icon}] <strong>{cm["match"]}</strong> '
+                                f'{cm.get("pre","")} → {cm.get("post","")} '
+                                f'(実結果: {cm.get("actual","")})</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                # ── レビュー表 ──
+                if not review_table.empty:
+                    st.markdown("#### 試合別レビュー")
+
+                    def _color_row(row):
+                        """行の色分け"""
+                        styles = [""] * len(row)
+                        if "的中" in row.index:
+                            if row["的中"] is True:
+                                styles = ["background-color: #f0fdf4"] * len(row)
+                            elif row["的中"] is False:
+                                styles = ["background-color: #fef2f2"] * len(row)
+                        if "波乱" in row.index and row.get("波乱") is True:
+                            styles = ["background-color: #fffbeb"] * len(row)
+                        if "D取逃" in row.index and row.get("D取逃") is True:
+                            styles = ["background-color: #fefce8"] * len(row)
+                        return styles
+
+                    styled = review_table.style.apply(_color_row, axis=1)
+                    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+                with st.expander("レビュー詳細JSON", expanded=False):
+                    st.json(summary)
+
+        # ── 3. 次節向け状態再計算 ──
+        if btn_state:
+            with st.spinner("チーム状態を再計算中..."):
+                history = wu_load_history()
+                if history.empty:
+                    st.warning("履歴データがありません。先に「1. 今週末結果を取得して履歴更新」を実行してください。")
+                else:
+                    # 特徴量再構築
+                    features_df = rebuild_post_result_features(history)
+                    # 最新チーム状態
+                    team_state = update_team_state_after_results(history)
+
+                    st.success(f"チーム状態を {len(team_state)} チーム分更新しました。")
+
+                    # 表示
+                    st.markdown("#### 更新後のチーム状態 (上位20)")
+                    state_rows = []
+                    for team, s in sorted(team_state.items(), key=lambda x: -x[1].get("elo", 0)):
+                        state_rows.append({
+                            "チーム": team,
+                            "ELO": round(s.get("elo", 1500), 1),
+                            "フォーム": "".join(s.get("form", [])),
+                            "得点平均": round(s.get("gf_avg", 0), 2),
+                            "失点平均": round(s.get("ga_avg", 0), 2),
+                            "勝点": s.get("points", 0),
+                            "試合": s.get("games", 0),
+                        })
+                    if state_rows:
+                        st.dataframe(
+                            pd.DataFrame(state_rows[:20]),
+                            hide_index=True, use_container_width=True,
+                        )
+
+                    with st.expander("全チーム状態", expanded=False):
+                        if state_rows:
+                            st.dataframe(
+                                pd.DataFrame(state_rows),
+                                hide_index=True, use_container_width=True,
+                            )
+
+    except Exception as exc:
+        st.error(f"週末レビュー表示中にエラー: {exc}")
+        with st.expander("エラー詳細"):
+            st.code(traceback.format_exc())
+
+
 # ─── メイン ───────────────────────────────────────────────
 
 def main():
@@ -2961,8 +3490,9 @@ def main():
 
     division, match = sidebar()
 
-    tab_one, tab_pred, tab_all, tab_hist, tab_stand, tab_about = st.tabs(
-        ["🚀 ワンボタン予測", "🔮 個別予測", "🗓️ 全試合予測", "📈 成績記録", "📊 順位表", "ℹ️ 使い方"]
+    tab_one, tab_pred, tab_all, tab_hist, tab_weekend, tab_stand, tab_about = st.tabs(
+        ["🚀 ワンボタン予測", "🔮 個別予測", "🗓️ 全試合予測", "📈 成績記録",
+         "📅 週末レビュー", "📊 順位表", "ℹ️ 使い方"]
     )
 
     with tab_one:
@@ -2989,6 +3519,9 @@ def main():
 
     with tab_hist:
         render_history(division)
+
+    with tab_weekend:
+        render_weekend_review(division)
 
     with tab_stand:
         st.markdown(f"### {division.upper()} 順位表")

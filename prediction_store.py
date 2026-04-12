@@ -65,6 +65,7 @@ def save_prediction(
     baseline_prediction: dict | None = None,
     model_version: str = "hybrid_v9.1",
     baseline_model_version: str = "v7_refined",
+    adjustments: dict | None = None,
 ) -> str:
     """
     予測を保存してIDを返す。
@@ -77,6 +78,9 @@ def save_prediction(
     shadow_prediction : Shadow modelの予測 (v8.1等, 内部ログ用)
     model_version : Primary modelのバージョン識別子
     baseline_model_version : Baseline modelのバージョン識別子
+    adjustments : fan/travel 補正の監視情報 (optional)
+        {fan_applied, travel_applied, fan_value, travel_value,
+         pre_h, pre_d, pre_a, post_h, post_d, post_a, argmax_changed}
     """
     predictions = load_all()
     key = f"{match['date']}_{match['home']}_{match['away']}"
@@ -118,6 +122,7 @@ def save_prediction(
             "model":           prediction.get("model", ""),
             "hybrid_selection": prediction.get("hybrid_selection", ""),
         },
+        "adjustments": adjustments,
         "baseline_prediction": baseline_entry,
         "shadow_prediction":   shadow_entry,
         "actual": None,
