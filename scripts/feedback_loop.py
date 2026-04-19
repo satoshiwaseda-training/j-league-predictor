@@ -14,6 +14,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# ─── Gemini 恒久無効化フラグ ───
+# scripts/predict_logic.py と同じフラグ (JLEAGUE_GEMINI_ENABLED) を参照。
+# 敗因分析・新指標提案機能も Gemini を使うので同時に無効化する。
+GEMINI_ENABLED: bool = os.getenv("JLEAGUE_GEMINI_ENABLED", "0") == "1"
+
 # ─────────────────────────────────────────────
 # 1. 予測精度分析
 # ─────────────────────────────────────────────
@@ -130,6 +135,14 @@ def ask_gemini_for_analysis(
         summary: str
         error: str | None
     """
+    # Gemini 恒久無効化
+    if not GEMINI_ENABLED:
+        return {
+            "error": "Gemini は恒久無効化されています (JLEAGUE_GEMINI_ENABLED=1 で再有効化可能)",
+            "defeat_causes": [], "weight_adjustments": [],
+            "new_indicators": [], "summary": "Gemini 無効化中のため分析不可",
+        }
+
     api_key = _resolve_api_key()
     if not api_key:
         return {
@@ -309,6 +322,12 @@ def ask_gemini_to_implement_indicators(
           "error": str | None,
         }
     """
+    # Gemini 恒久無効化
+    if not GEMINI_ENABLED:
+        return {"error": "Gemini は恒久無効化されています (JLEAGUE_GEMINI_ENABLED=1 で再有効化可能)",
+                "score_functions": [], "updated_weights": {},
+                "integration_snippet": ""}
+
     api_key = _resolve_api_key()
     if not api_key:
         return {"error": "GEMINI_API_KEY 未設定", "score_functions": [],

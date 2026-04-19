@@ -1,6 +1,7 @@
 """
 prediction_store.py - 予測履歴の保存・管理
-data/predictions.json に永続化
+data/predictions.json に永続化 (同一試合は上書き)
+data/predictions.log.jsonl に追記専用ログ (全予測イベントをタイムスタンプ順に保持)
 """
 from __future__ import annotations
 
@@ -10,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 
 STORE_PATH = Path(__file__).parent / "data" / "predictions.json"
+# 追記専用ログ: 同一試合を複数回予測しても全て残す
+LOG_PATH = Path(__file__).parent / "data" / "predictions.log.jsonl"
 
 _WINNER_LABEL_TO_CODE = {"ホーム勝利": "home", "引き分け": "draw", "アウェー勝利": "away"}
 _WINNER_CODE_TO_LABEL = {v: k for k, v in _WINNER_LABEL_TO_CODE.items()}
@@ -102,7 +105,7 @@ def save_prediction(
     baseline_entry = _format_side_prediction(baseline_prediction, baseline_model_version)
 
     pred_id = str(uuid.uuid4())[:8]
-    predictions.insert(0, {
+    entry = {
         "id":       pred_id,
         "_key":     key,
         "saved_at": datetime.now().isoformat(),
@@ -126,9 +129,26 @@ def save_prediction(
         "baseline_prediction": baseline_entry,
         "shadow_prediction":   shadow_entry,
         "actual": None,
-    })
+    }
+    predictions.insert(0, entry)
     _write_all(predictions)
+    _append_log(entry)
     return pred_id
+
+
+def _append_log(entry: dict) -> None:
+    """追記専用ログに 1 行 JSON を append。
+    data/predictions.json が上書きで消える既存試合の予測も、
+    このログには全予測イベントがタイムスタンプ順に残る。
+    書き込み失敗してもメイン保存は継続する (best-effort)。
+    """
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        # ログ書き込みはメイン保存を邪魔しない
+        pass
 
 
 def update_actual(pred_id: str, score: str, winner_label: str) -> bool:
@@ -146,6 +166,14 @@ def update_actual(pred_id: str, score: str, winner_label: str) -> bool:
                 "recorded_at":  datetime.now().isoformat(),
             }
             _write_all(predictions)
+            # 結果反映イベントも JSONL ログに追記
+            _append_log({
+                "event":   "actual_updated",
+                "id":      pred_id,
+                "_key":    p.get("_key"),
+                "updated_at": datetime.now().isoformat(),
+                "actual":  p["actual"],
+            })
             return True
     return False
 

@@ -26,6 +26,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# ─── Gemini 無効化フラグ ─────────────────────────────────
+# 2026-04 の実データ比較 (n=19 ペア) で Gemini 補正は accuracy を変えず
+# Brier/logloss を悪化させ、強烈なホームバイアス (89% home予測) を持つ
+# ことが確認された。恒久的に無効化し、統計モデル (hybrid_v9.1) のみで
+# 予測する。環境変数 JLEAGUE_GEMINI_ENABLED=1 で一時的に再有効化可能。
+#
+# 予測ロジックには一切手を付けず、Gemini API 呼び出しのみを短絡する。
+# 確率は従来どおり hybrid_v9.1 (v7 + Skellam) から得られるので、
+# UI も predicted_score とreasoning 以外は変わらない。
+GEMINI_ENABLED: bool = os.getenv("JLEAGUE_GEMINI_ENABLED", "0") == "1"
+
 # ─── Primary Model Selector ─────────────────────────────
 # "hybrid_v9.1" = 本番昇格済み (v7 + Skellam dynamic の統合モデル)
 # "v7_refined"  = fallback (hybrid_v9.1 を無効化したい場合)
@@ -1238,6 +1249,18 @@ def generate_reasoning_with_gemini(
       "model": str,
     }
     """
+    # ─── Gemini 恒久無効化ガード ───
+    # GEMINI_ENABLED が False の場合、API を呼ばずに空結果を返す。
+    # 呼び出し側 (app.py) は reasoning が空のとき reasoning ブロックを
+    # 描画しないので UI への影響は最小化される。
+    if not GEMINI_ENABLED:
+        return {
+            "reasoning": "",
+            "predicted_score": "?-?",
+            "key_factors": [],
+            "model": "none",
+        }
+
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key or api_key == "your_gemini_api_key_here":
         return {
@@ -1386,6 +1409,16 @@ def predict_with_gemini(
     パラメータ貢献度をGemini 2.5 Flashに渡し、
     最終的な確率と深い分析根拠を取得する。
     """
+    # ─── Gemini 恒久無効化ガード ───
+    # GEMINI_ENABLED が False の場合、統計モデル単独で確率を算出して返す。
+    # 既存の「Gemini API未設定時」と同じ動作経路に落とす。
+    if not GEMINI_ENABLED:
+        h_pct, d_pct, a_pct = advantage_to_probs(
+            contributions["raw_home_advantage"],
+            contributions.get("closeness", 0.5),
+        )
+        return _statistical_result(home_team, away_team, h_pct, d_pct, a_pct, contributions)
+
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key or api_key == "your_gemini_api_key_here":
         # Gemini未設定時は統計モデルのみで予測
