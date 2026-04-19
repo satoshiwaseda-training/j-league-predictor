@@ -1331,18 +1331,22 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                     hybrid_selection = hybrid["selection"]
                     skellam_raw = hybrid.get("skellam_raw", {})
                     skellam_boost = hybrid.get("skellam_boost", 0)
+                    # Skellam の最頻スコア (Poisson × Poisson の argmax) を予想スコアに使う
+                    stat_predicted_score = hybrid.get("predicted_score", "1-1") or "1-1"
                     primary_version = "hybrid_v9.1"
                 except Exception:
                     hyb_h, hyb_d, hyb_a = stat_h, stat_d, stat_a
                     hybrid_selection = "v7_raw"
                     skellam_raw = {}
                     skellam_boost = 0
+                    stat_predicted_score = "1-1"
                     primary_version = "v7_refined"
             else:
                 hyb_h, hyb_d, hyb_a = stat_h, stat_d, stat_a
                 hybrid_selection = "v7_raw"
                 skellam_raw = {}
                 skellam_boost = 0
+                stat_predicted_score = "1-1"
                 primary_version = "v7_refined"
 
             # ── Step 3: Geminiに reasoning のみ生成させる (確率は所与) ──
@@ -1390,12 +1394,21 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             gemini_key_factors = gemini_result.get("key_factors", [])
             gemini_qual_label = gemini_result.get("qualitative_label", "")
 
+            # 予想スコアの最終決定
+            # Gemini がスコアを出しているときは Gemini を優先、そうでないとき
+            # (無効化時 or "?-?" 時) は Skellam の最頻スコアを使う。
+            # Skellam は Poisson×Poisson の joint pmf から最頻の (i, j) を選ぶ
+            # 確率統計ベースの推定なので、信頼性は担保される。
+            final_predicted_score = gemini_score
+            if not final_predicted_score or final_predicted_score == "?-?":
+                final_predicted_score = stat_predicted_score
+
             # ── Step 4: 最終prediction ──
             prediction = {
                 "home_win_prob": hyb_h,
                 "draw_prob": hyb_d,
                 "away_win_prob": hyb_a,
-                "predicted_score": gemini_score,
+                "predicted_score": final_predicted_score,
                 "confidence": "medium",  # _classify_predictionで再計算
                 "reasoning": gemini_reasoning,
                 "key_factors": gemini_key_factors,

@@ -1174,15 +1174,25 @@ def compute_hybrid_v9(
         a = 100 - h - d
         selection = "weighted"
 
+    # ─── predicted_score: Skellam モデルの最頻スコア ───
+    # Skellam (Poisson×Poisson) は λ_home/λ_away (期待ゴール) から
+    # 各試合で P(X=i, Y=j) を計算し、最頻の (i, j) を「予想スコア」として返す。
+    # 確率統計に基づいた推定で、Gemini の当てずっぽうや hardcoded 値より信頼性が高い。
+    # selection=v7/weighted のときも Skellam の λ は team strength から計算されるため
+    # スコア予測としてはそのまま使える (勝敗 argmax との不一致は自然なこと)。
+    sk_pred_score = sk.get("predicted_score", "1-1") or "1-1"
+
     return {
         "home_win_prob": h,
         "draw_prob": d,
         "away_win_prob": a,
-        "predicted_score": v7_prediction.get("predicted_score", "?-?"),
+        "predicted_score": sk_pred_score,
         "selection": selection,
         "skellam_raw": {"home": sk_h, "draw": sk_d, "away": sk_a},
         "skellam_boost": sk.get("dynamic_boost", 0.0),
         "model_version": "hybrid_v9.1",
+        "lambda_home": sk.get("lambda_home"),
+        "lambda_away": sk.get("lambda_away"),
     }
 
 
