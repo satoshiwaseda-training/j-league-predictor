@@ -1263,12 +1263,18 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
             _travel_cond = _long and (_rest is not None and _rest <= 3)
             _away_f_adv = _away_f if _travel_cond else 0.0
 
+            # ダービー判定
+            from fan_travel_features import is_derby as _is_derby
+            _derby_flag = _is_derby(home, away)
+
             # ── 補正前の確率 (監視用) ──
             _pre_h, _pre_d, _pre_a = advantage_to_probs(
                 contributions["raw_home_advantage"], closeness,
                 draw_env_score=_draw_env, elo_gap=_elo_gap)
 
             # ── Step 1: 純統計v7確率 (Gemini未介入) ──
+            # tiebreak 実験は advantage_to_probs 側が未対応のため一時的に無効化
+            # 再開時は advantage_to_probs に is_derby/tiebreak_mode/return_meta を実装してから戻す
             stat_h, stat_d, stat_a = advantage_to_probs(
                 contributions["raw_home_advantage"], closeness,
                 draw_env_score=_draw_env, elo_gap=_elo_gap,
@@ -1978,7 +1984,6 @@ def _get_strategy_label(
         h_form_w = sum(1 for r in home_form[-5:] if r == "W")
         if h_form_w < 2:
             confidence = "medium"
-
     if confidence == "high":
         if draw_alert:
             # ─── 改修B: 最強には max_prob >= 60 の絶対下限 ───
@@ -3394,6 +3399,93 @@ def render_weekend_review(division: str):
                     adj_c1.metric("Fan補正適用", f"{adj_stats.get('fan_applied_count', 0)}試合")
                     adj_c2.metric("Travel発火", f"{adj_stats.get('travel_applied_count', 0)}試合")
                     adj_c3.metric("ラベル変化", f"{adj_stats.get('argmax_changed_count', 0)}試合")
+
+                # ── タイブレイク監視 (実験モード) ──
+                tb_mode = adj_stats.get("tiebreak_mode", "off")
+                tb_count = adj_stats.get("tiebreak_applied_count", 0)
+                if tb_mode != "off" or tb_count > 0:
+                    st.markdown(f"##### タイブレイク監視 (mode: `{tb_mode}`)")
+                    tb_metrics = adj_stats.get("tiebreak_metrics", {})
+                    tb_dr = adj_stats.get("tiebreak_draw_recall")
+
+                    tbc1, tbc2, tbc3, tbc4 = st.columns(4)
+                    tbc1.metric("発動試合数", f"{tb_count}")
+                    tbc2.metric("発動時 Acc", f"{tb_metrics.get('accuracy', 0)*100:.1f}%" if tb_metrics.get("accuracy") is not None else "—")
+                    tbc3.metric("発動時 Brier", f"{tb_metrics.get('avg_brier'):.4f}" if tb_metrics.get("avg_brier") is not None else "—")
+                    tbc4.metric("発動時 D-Recall", f"{tb_dr*100:.1f}%" if tb_dr is not None else "—")
+
+                    tb_matches = adj_stats.get("tiebreak_matches", [])
+                    if tb_matches:
+                        st.markdown("**タイブレイク発動試合:**")
+                        for tm in tb_matches:
+                            icon = "O" if tm.get("correct") else "X"
+                            st.markdown(
+                                f'<div style="background:#fef9c3;border:1px solid #facc15;'
+                                f'border-radius:8px;padding:0.5rem 1rem;margin-bottom:0.3rem;">'
+                                f'[{icon}] <strong>{tm["match"]}</strong> '
+                                f'方向={tm.get("direction","-")} 実={tm.get("actual","")}</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                # ── タイブレイク本番昇格判定 (累積評価) ──
+                promotion = review.get("tiebreak_promotion")
+                if promotion:
+                    measured = promotion.get("measured", {})
+                    applied = measured.get("applied", {})
+                    baseline_m = measured.get("baseline_non_applied", {})
+                    off_m = measured.get("off_all", {})
+                    strict_all = measured.get("strict_all", {})
+                    checks = promotion.get("checks", {})
+                    ready = promotion.get("ready_for_production")
+                    blockers = promotion.get("blockers", [])
+
+                    # 累積 strict サンプルがある or production 検討中なら表示
+                    if applied.get("n", 0) > 0 or strict_all.get("n", 0) > 0:
+                        st.markdown("##### タイブレイク 本番昇格判定 (累積)")
+                        if ready:
+                            st.success("すべての基準を満たしました。production 昇格可能。")
+                        else:
+                            st.warning("本番昇格には基準未達項目があります。")
+
+                        # 基準チェック表
+                        criteria = promotion.get("criteria", {})
+                        check_rows = []
+                        def _mark(v):
+                            if v is True: return "OK"
+                            if v is False: return "NG"
+                            return "?"
+                        check_rows.append({
+                            "基準": f"① 発動試合数 >= {criteria.get('min_applied_count')}",
+                            "計測": f"{applied.get('n', 0)}件",
+                            "判定": _mark(checks.get("min_applied_count")),
+                        })
+                        check_rows.append({
+                            "基準": "② 発動時Brier < 非発動時Brier",
+                            "計測": f"{applied.get('brier','-')} vs {baseline_m.get('brier','-')}",
+                            "判定": _mark(checks.get("brier_improves")),
+                        })
+                        tol = criteria.get("draw_recall_drop_tolerance_pp", 15)
+                        app_dr = applied.get("d_recall")
+                        base_dr = baseline_m.get("d_recall")
+                        dr_str = "—"
+                        if app_dr is not None and base_dr is not None:
+                            dr_str = f"{app_dr*100:.1f}% vs {base_dr*100:.1f}%"
+                        check_rows.append({
+                            "基準": f"③ Draw Recall低下 <= {tol}pp",
+                            "計測": dr_str,
+                            "判定": _mark(checks.get("draw_recall_tolerance")),
+                        })
+                        check_rows.append({
+                            "基準": "④ 全体LogLoss 悪化なし",
+                            "計測": f"{strict_all.get('ll','-')} vs {off_m.get('ll','-')}",
+                            "判定": _mark(checks.get("logloss_not_worsen")),
+                        })
+                        st.dataframe(pd.DataFrame(check_rows), hide_index=True, use_container_width=True)
+
+                        if blockers:
+                            with st.expander("未達項目の詳細"):
+                                for b in blockers:
+                                    st.markdown(f"- {b}")
 
                     # Fan補正あり vs なしの比較
                     fm = adj_stats.get("fan_applied_metrics", {})
