@@ -1423,6 +1423,33 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 "draw": hyb_d - stat_d,
                 "away": hyb_a - stat_a,
             } if (hyb_h != stat_h or hyb_d != stat_d or hyb_a != stat_a) else None
+
+            # ─── 軽読み昇格用の副次シグナル (gd_diff, rank_diff, pred_winner) ───
+            # 2026-04 のスキップ層サブグループ分析で、これらの値があれば
+            # _get_strategy_label が「軽読み」への昇格判定を行える。
+            def _as_int_signed(v):
+                try:
+                    return int(str(v).replace("+", "").strip() or 0)
+                except (ValueError, TypeError):
+                    return 0
+            try:
+                _h_rank = _as_int_signed(home_stats.get("順位"))
+                _a_rank = _as_int_signed(away_stats.get("順位"))
+                _h_games = max(_as_int_signed(home_stats.get("試合")) or 1, 1)
+                _a_games = max(_as_int_signed(away_stats.get("試合")) or 1, 1)
+                _h_gd = _as_int_signed(home_stats.get("得失点差"))
+                _a_gd = _as_int_signed(away_stats.get("得失点差"))
+                _rank_diff = _a_rank - _h_rank if (_h_rank and _a_rank) else None
+                _gd_diff = (_h_gd / _h_games) - (_a_gd / _a_games)
+            except Exception:
+                _rank_diff = None
+                _gd_diff = None
+            # pred_winner は確率の argmax
+            _hyb_winner = (
+                "home" if hyb_h >= hyb_d and hyb_h >= hyb_a
+                else ("away" if hyb_a > hyb_h and hyb_a >= hyb_d else "draw")
+            )
+
             preds.append({
                 "match": match, "prediction": prediction,
                 "home_form": home_form, "away_form": away_form,
@@ -1430,6 +1457,9 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                 "data_quality": dq,
                 "stat_prior": {"home": stat_h, "draw": stat_d, "away": stat_a},
                 "gemini_diff": gem_diff,
+                "pred_winner": _hyb_winner,
+                "rank_diff": _rank_diff,
+                "gd_diff": _gd_diff,
             })
             snapshots.append(build_feature_snapshot(
                 match, prediction, contributions, pipeline, gemini_used,
@@ -1845,11 +1875,15 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         "caution": "border-left:3px solid #eab308;",
     }.get(spotlight, "")
 
-    # 戦略ラベル (confidence × draw_alert × dq_rank × max_prob × home_form)
+    # 戦略ラベル (confidence × draw_alert × dq_rank × max_prob × home_form
+    #            + 軽読み昇格用 pred_winner / rank_diff / gd_diff)
     strategy = _get_strategy_label(
         cl, cls.get("draw_alert", False), dq_rank,
         max_prob=cls.get("max_prob"),
         home_form=data.get("home_form"),
+        pred_winner=data.get("pred_winner"),
+        rank_diff=data.get("rank_diff"),
+        gd_diff=data.get("gd_diff"),
     )
     # カード左ボーダーを戦略ラベル優先で上書き
     if strategy["priority"] == 0:
@@ -1917,7 +1951,7 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         f'</div>'
         f'<div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">'
         f'<span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span></div>'
-        f'{_build_recommendation(cl, dq_rank, cls.get("draw_alert", False), h_pct, d_pct, a_pct, max_prob=cls.get("max_prob"), home_form=data.get("home_form"))}'
+        f'{_build_recommendation(cl, dq_rank, cls.get("draw_alert", False), h_pct, d_pct, a_pct, max_prob=cls.get("max_prob"), home_form=data.get("home_form"), pred_winner=data.get("pred_winner"), rank_diff=data.get("rank_diff"), gd_diff=data.get("gd_diff"))}'
         f'{details_html}'
         f'</div>'
     )
@@ -1930,6 +1964,9 @@ def _get_strategy_label(
     dq_rank: str = "B",
     max_prob: int | None = None,
     home_form: list[str] | None = None,
+    pred_winner: str | None = None,
+    rank_diff: float | None = None,
+    gd_diff: float | None = None,
 ) -> dict:
     """
     confidence x draw_alert x dq_rank から戦略ラベルを決定する。
@@ -2070,6 +2107,37 @@ def _get_strategy_label(
             }
     else:  # low
         if draw_alert:
+            # ─── 軽読み昇格判定 (スキップ → 軽読み) ───
+            # Root cause: 2025 + 2026 walk-forward 分析で、スキップ層の中に
+            # 副次シグナル (得失点差 or 順位差) が強い試合は 54.1% 当たる
+            # サブグループ (n=37, baseline 33-36%) があることを確認。
+            # 2026 ホールドアウトでも同傾向が再現された。
+            #
+            # 条件 (すべて AND):
+            #   - pred_winner != "draw" (モデルが引き分けを第一推奨にしていない)
+            #   - gd_diff >= 0.5 OR rank_diff <= -10
+            #     (ホームの得失点強 or アウェーが 10 順位以上上位)
+            is_promotable = (
+                pred_winner in ("home", "away")
+                and (
+                    (gd_diff is not None and gd_diff >= 0.5)
+                    or (rank_diff is not None and rank_diff <= -10)
+                )
+            )
+            if is_promotable:
+                return {
+                    "label": "軽読み",
+                    "icon": "🎲",
+                    "tier": "light_read",
+                    "bg": "#ede9fe",
+                    "border": "#c4b5fd",
+                    "color": "#5b21b6",
+                    "priority": 3,
+                    "description": (
+                        "スキップだが副次シグナル強。実証正答率 54% (n=37)."
+                        "第一推奨への小口ベット推奨 (ROI 黒字帯)"
+                    ),
+                }
             return {
                 "label": "スキップ",
                 "icon": "⛔",
@@ -2101,6 +2169,9 @@ def _build_recommendation(
     h_pct: int, d_pct: int, a_pct: int,
     max_prob: int | None = None,
     home_form: list[str] | None = None,
+    pred_winner: str | None = None,
+    rank_diff: float | None = None,
+    gd_diff: float | None = None,
 ) -> str:
     """最終推奨バッジを生成。戦略ラベルと連動。"""
 
@@ -2112,10 +2183,11 @@ def _build_recommendation(
 
     first_label = {"home": "ホーム勝ち", "draw": "引き分け", "away": "アウェー勝ち"}[first_cls]
 
-    # 戦略ラベルから style 取得 (改修A+B の引数も渡す)
+    # 戦略ラベルから style 取得 (改修A+B + 軽読み昇格の引数も渡す)
     strategy = _get_strategy_label(
         confidence, draw_alert, dq_rank,
         max_prob=max_prob, home_form=home_form,
+        pred_winner=pred_winner, rank_diff=rank_diff, gd_diff=gd_diff,
     )
     style_icon = strategy["icon"]
     style_text = strategy["label"]
