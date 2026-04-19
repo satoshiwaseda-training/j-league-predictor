@@ -1839,8 +1839,12 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         "caution": "border-left:3px solid #eab308;",
     }.get(spotlight, "")
 
-    # 戦略ラベル (confidence × draw_alert × dq_rank)
-    strategy = _get_strategy_label(cl, cls.get("draw_alert", False), dq_rank)
+    # 戦略ラベル (confidence × draw_alert × dq_rank × max_prob × home_form)
+    strategy = _get_strategy_label(
+        cl, cls.get("draw_alert", False), dq_rank,
+        max_prob=cls.get("max_prob"),
+        home_form=data.get("home_form"),
+    )
     # カード左ボーダーを戦略ラベル優先で上書き
     if strategy["priority"] == 0:
         # 最強 → ゴールドボーダー
@@ -1907,7 +1911,7 @@ def _render_enhanced_card(data: dict, standings: pd.DataFrame):
         f'</div>'
         f'<div style="display:flex;justify-content:space-between;font-size:0.62rem;color:#4b5563;">'
         f'<span>ホーム勝利</span><span>引き分け</span><span>アウェー勝利</span></div>'
-        f'{_build_recommendation(cl, dq_rank, cls.get("draw_alert", False), h_pct, d_pct, a_pct)}'
+        f'{_build_recommendation(cl, dq_rank, cls.get("draw_alert", False), h_pct, d_pct, a_pct, max_prob=cls.get("max_prob"), home_form=data.get("home_form"))}'
         f'{details_html}'
         f'</div>'
     )
@@ -1918,6 +1922,8 @@ def _get_strategy_label(
     confidence: str,
     draw_alert: bool,
     dq_rank: str = "B",
+    max_prob: int | None = None,
+    home_form: list[str] | None = None,
 ) -> dict:
     """
     confidence x draw_alert x dq_rank から戦略ラベルを決定する。
@@ -1934,6 +1940,23 @@ def _get_strategy_label(
     | low        | Yes       | スキップ ⛔  | 39.9% | 10.0% |
     | low        | No        | 見送り ⏭    | 44.4% | 100%  |
 
+    2026-04-18 week の外し分析を受けて追加された高確信ガード (改修A+B):
+      1. ホーム直近5戦の W < 2 の場合、confidence=high を medium に降格
+         → 湘南×群馬 (96%, form_w=1, 実敗), 鹿島×浦和 (73%, form_w=1, 実勝)
+           のうち弱フォームを事前に排除
+      2. 最強昇格には max_prob >= 60 を追加条件に
+         → 甲府×藤枝 (57%, 実敗) のように draw_alert が立っていても
+           絶対確率が低い試合を最強から外す
+
+    バックテスト (J1+J2 2025, n=751):
+      baseline HIGH層 53.1% → 改修A+B (w<2, floor=0.60) で 60.4% (+7.3pp)
+      週末 (n=7) では 57.1% → 66.7% (+9.6pp)
+
+    Parameters (改修A+B で追加)
+    ----------
+    max_prob : 1位確率 (0-100). 省略時は改修B を適用しない。
+    home_form : ホームの直近結果 ["W","L","D",...]。省略時は改修A を適用しない。
+
     Returns
     -------
     {
@@ -1947,8 +1970,35 @@ def _get_strategy_label(
         "description": str, # ツールチップ
     }
     """
+    # ─── 改修A: ホーム直近5戦 W 数 < 2 で high → medium 降格 ───
+    # Root cause: 2026-04-18 の失敗3試合はいずれもホームがフォーム弱 (W<=2)
+    #   湘南 W-D-D-L-L (W=1), 大宮 D-D-W-W-L (W=2), 甲府 W-L-W-L-L (W=2)
+    # 徳島 W-W-W-W-W (W=5) など of好フォーム高確信は保持。
+    if confidence == "high" and home_form is not None:
+        h_form_w = sum(1 for r in home_form[-5:] if r == "W")
+        if h_form_w < 2:
+            confidence = "medium"
+
     if confidence == "high":
         if draw_alert:
+            # ─── 改修B: 最強には max_prob >= 60 の絶対下限 ───
+            # Root cause: 甲府×藤枝 (57%, 最強, 実敗) のように
+            # draw_alert が立っていても絶対確率が低い時は信頼できない。
+            # backtest で max_prob < 60 の 最強 は想定より低い正答率。
+            if max_prob is not None and max_prob < 60:
+                return {
+                    "label": "組み合わせ",
+                    "icon": "🎯",
+                    "tier": "combo",
+                    "bg": "#eff6ff",
+                    "border": "#bfdbfe",
+                    "color": "#1d4ed8",
+                    "priority": 2,
+                    "description": (
+                        "高確信+Draw警戒だが絶対確率 60% 未満のため"
+                        "最強から降格。組み合わせ賭けを推奨"
+                    ),
+                }
             return {
                 "label": "最強",
                 "icon": "🏆",
@@ -1958,7 +2008,7 @@ def _get_strategy_label(
                 "color": "#92400e",
                 "priority": 0,
                 "description": (
-                    "高確信+Draw警戒の組み合わせ。"
+                    "高確信+Draw警戒+絶対確率 60%↑ の組み合わせ。"
                     "実証正答率 75-80%. 最も信頼できる試合"
                 ),
             }
@@ -2044,6 +2094,8 @@ def _get_strategy_label(
 def _build_recommendation(
     confidence: str, dq_rank: str, draw_alert: bool,
     h_pct: int, d_pct: int, a_pct: int,
+    max_prob: int | None = None,
+    home_form: list[str] | None = None,
 ) -> str:
     """最終推奨バッジを生成。戦略ラベルと連動。"""
 
@@ -2055,8 +2107,11 @@ def _build_recommendation(
 
     first_label = {"home": "ホーム勝ち", "draw": "引き分け", "away": "アウェー勝ち"}[first_cls]
 
-    # 戦略ラベルから style 取得
-    strategy = _get_strategy_label(confidence, draw_alert, dq_rank)
+    # 戦略ラベルから style 取得 (改修A+B の引数も渡す)
+    strategy = _get_strategy_label(
+        confidence, draw_alert, dq_rank,
+        max_prob=max_prob, home_form=home_form,
+    )
     style_icon = strategy["icon"]
     style_text = strategy["label"]
     style_bg = strategy["bg"]
