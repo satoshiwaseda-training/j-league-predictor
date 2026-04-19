@@ -333,10 +333,15 @@ def compute_data_quality(
     """
     試合単位のデータ品質ランクを算出する。
 
-    A: 公式データ + xG + ELO + Gemini (全ソース利用)
-    B: 公式データ + ELO + (xG or Gemini のどちらかが欠落)
-    C: 公式データのみ (xG/Gemini なし)
-    D: 公式データも不完全 (順位表なし等)
+    2026-04 の Gemini 恒久無効化に伴い、ランク定義を再構成:
+
+    A: 公式データ + ELO + xG (J1 のみ到達可能)
+    B: 公式データ + ELO (xG なしでも到達可、J2/J3 の通常到達点)
+    C: 公式データのみ (ELO が無い = シーズン初期等)
+    D: 公式データが不完全 (順位表 or 試合結果が欠落)
+
+    gemini_used は互換性のために引数に残してあるが、ランク判定には使わない
+    (Gemini 補正は精度を下げる結果が出たため恒久無効化済み)。
 
     Returns: {rank, label, color, sources_used, note}
     """
@@ -357,20 +362,19 @@ def compute_data_quality(
         sources.append("xG")
     if has_discipline:
         sources.append("規律")
-    if gemini_used:
-        sources.append("Gemini")
+    # gemini_used は既定で False。無効化済みなので sources には含めない。
 
     official_ok = has_standings and has_results
 
-    if official_ok and has_elo and has_xg and gemini_used:
+    if official_ok and has_elo and has_xg:
         rank, label, color = "A", "最高品質", "#16a34a"
-        note = "全データソース利用"
-    elif official_ok and has_elo and (has_xg or gemini_used):
+        note = "公式 + ELO + xG"
+    elif official_ok and has_elo:
         rank, label, color = "B", "高品質", "#2563eb"
-        note = "xG未取得" if not has_xg else ("Gemini未使用" if not gemini_used else "")
+        note = "xG未取得" if not has_xg else "公式 + ELO"
     elif official_ok:
-        rank, label, color = "C", "公式データ中心", "#ca8a04"
-        note = "公式データ中心の簡略版予測"
+        rank, label, color = "C", "公式データのみ", "#ca8a04"
+        note = "ELO未整備 (シーズン初期など)"
     else:
         rank, label, color = "D", "データ不足", "#dc2626"
         missing = []
@@ -383,6 +387,7 @@ def compute_data_quality(
         note = f"未取得: {', '.join(missing)}"
 
     # 全ランク共通: 不足データの詳細
+    # Gemini は恒久無効化済みなので missing には含めない
     missing_detail = []
     if not has_standings:
         missing_detail.append("順位表")
@@ -394,8 +399,6 @@ def compute_data_quality(
         missing_detail.append("xG統計")
     if not has_discipline:
         missing_detail.append("規律統計")
-    if not gemini_used:
-        missing_detail.append("Gemini AI")
 
     return {
         "rank": rank,
