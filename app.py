@@ -39,6 +39,7 @@ from prediction_store import (
     update_actual as store_update_actual,
     delete_prediction as store_delete,
     get_accuracy_stats,
+    get_archive_root,
 )
 from weekend_update import (
     run_weekend_update,
@@ -656,6 +657,11 @@ def render_prediction(match: dict, division: str):
                 home_cards=home_cards, away_cards=away_cards,
                 home_injuries=home_inj, away_injuries=away_inj,
             )
+        try:
+            pred_id = store_save(division, match, prediction)
+            st.caption(f"予測を自動保存しました: {pred_id}")
+        except Exception as save_exc:
+            st.warning(f"予測の自動保存に失敗しました: {save_exc}")
 
     except Exception as exc:
         st.error(f"データ取得・分析中にエラーが発生しました: {exc}")
@@ -1207,6 +1213,7 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
     total_p = len(matches)
     preds = []
     snapshots = []
+    saved_n = 0
     for i, match in enumerate(matches):
         home, away = match["home"], match["away"]
         progress.progress((7 + (i / total_p)) / (8 + 1),
@@ -1500,6 +1507,7 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                     baseline_model_version="v7_refined",
                     adjustments=_adjustments,
                 )
+                saved_n += 1
             except TypeError:
                 try:
                     store_save(
@@ -1507,8 +1515,10 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                         shadow_prediction=shadow_pred,
                         model_version=primary_version,
                     )
+                    saved_n += 1
                 except TypeError:
                     store_save(division, match, prediction)
+                    saved_n += 1
         except Exception as exc:
             import traceback as _tb
             preds.append({
@@ -1544,6 +1554,8 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
         "fetched_at": pipeline.generated_at,
         "n_matches": len(matches),
         "snapshots": snapshots,
+        "saved_n": saved_n,
+        "archive_root": str(get_archive_root()),
     }
     st.rerun()
 
@@ -1582,6 +1594,19 @@ def _render_onebutton_results(result: dict, division: str):
         {source_badges}
       </div>
     </div>""", unsafe_allow_html=True)
+    if result.get("archive_root"):
+        saved_n = result.get("saved_n", 0)
+        if saved_n:
+            st.success(
+                f"予測結果を {saved_n} 件保存しました: "
+                f"{result['archive_root']}"
+            )
+        else:
+            st.warning(
+                f"予測は表示されましたが、保存件数が0件です。"
+                f"保存先: {result['archive_root']}"
+            )
+        st.caption("保存形式: J1/J2 → 試合日フォルダ → AI判定用JSON + index.csv")
 
     # ── サマリーカウント ──
     valid = [p for p in preds if "error" not in p]
@@ -2089,8 +2114,9 @@ def _get_strategy_label(
                 "color": "#a16207",
                 "priority": 2,
                 "description": (
-                    "中確信+Draw警戒。接戦の可能性あり。"
-                    "引き分け含みで慎重に"
+                    "中確信+Draw警戒。実証 1st単勝 acc 46% / ROI +26%。"
+                    "1st+draw 組合せなら hit率 74% (ROI 低下)。"
+                    "ROI重視→単勝、分散低減→組合せを選択"
                 ),
             }
         elif dq_rank in ("A", "B"):
@@ -2219,13 +2245,22 @@ def _build_recommendation(
     # ── 第二推奨 (中確信・低確信のみ) ──
     second_html = ""
     if confidence != "high":
-        # draw警戒時はdrawを第二推奨に優先
-        if draw_alert and second_cls != "draw" and d_pct >= second_pct - 3:
+        # draw 警戒時は draw を第二推奨に強制 (3pp 制限を撤廃)
+        # 2026-04-25 週末分析: 波乱狙い 7試合中 2試合が引き分け (28.6%)。
+        # 1st 単勝はベストROIだが分散大、1st+draw 組合せなら hit率 74%。
+        # 第2推奨を必ず draw にしておけば、組合せ買いを選ぶユーザーが
+        # 自然に「単勝 + draw 保険」の構造で買える。
+        # 第1推奨が draw なら 2nd は確率順 (home or away) を維持。
+        if draw_alert and confidence == "medium" and first_cls != "draw":
+            second_cls = "draw"
+            second_pct = d_pct
+        elif draw_alert and second_cls != "draw" and d_pct >= second_pct - 3:
+            # 中確信以外 (low) では従来ロジックを維持
             second_cls = "draw"
             second_pct = d_pct
 
         second_label_map = {
-            "draw": "引き分け寄り",
+            "draw": "引き分け寄り (組合せ用)",
             "home": "勝敗寄り (ホーム勝ち)",
             "away": "勝敗寄り (アウェー勝ち)",
         }
@@ -2449,7 +2484,12 @@ def render_all_predictions(division: str):
             if "error" not in data:
                 store_save(division, data["match"], data["prediction"])
                 saved_n += 1
-        st.success(f"✅ {saved_n}試合の予測を履歴に保存しました。「📈 成績記録」タブで実際の結果を入力できます。")
+        archive_root = get_archive_root()
+        st.success(
+            f"✅ {saved_n}試合の予測を履歴に保存しました。"
+            f"指定フォルダ: {archive_root}"
+        )
+        st.caption("J1/J2 → 試合日フォルダの順に、AI判定用JSONとindex.csvを保存します。")
 
     # ── 結果表示 ────────────────────────────────────────
     if cache_key not in st.session_state:
