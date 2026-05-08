@@ -1115,7 +1115,8 @@ def compute_hybrid_v9(
     xg_away: dict | None = None,
 ) -> dict:
     """
-    Hybrid v9.1 (攻撃型): v7 と Skellam dynamic を動的選択する統合モデル。
+    Hybrid v9.1 (攻撃型): v7 と Skellam dynamic を動的選択し、
+    最後に v7/ELO で薄く校正する統合モデル。
 
     選択ルール (最適化済み, draw 40-55制約内):
     1. v7 draw警戒 (draw>=30% かつ |H-A|<10pp) → v7採用
@@ -1123,8 +1124,9 @@ def compute_hybrid_v9(
     3. Clear favorite (|λ差|>=0.5 or |ELO差|>=0.15) かつ Skellam非draw → Skellam採用
     4. それ以外 → Skellam 0.5 + v7 0.5 の重み付き平均
 
-    val=2025 n=377: acc=0.475 F1=0.428 draw=55 drawF1=0.276
-    2026 holdout n=41: acc=0.415 F1=0.349
+    v9.1-calibrated (2026-05): selected 0.4 + v7 0.5 + ELO 0.1.
+    val=2025 n=377: acc=0.483 / logloss=1.048
+    2026 current n=79: acc=0.430 / logloss=1.069
     選択割合 val=2025: v7 45% / Skellam 42% / weighted 13%
     """
     try:
@@ -1174,6 +1176,33 @@ def compute_hybrid_v9(
         a = 100 - h - d
         selection = "weighted"
 
+    # ─── final calibration blend ─────────────────────────
+    # 選択器は draw recall を改善する一方、2025/2026 の実測では単独採用だと
+    # logloss と accuracy がやや不安定だった。安定している v7 を主軸に戻し、
+    # ELO を 10% だけ混ぜることで過信を抑える。
+    def _elo_probs(eh: float | None, ea: float | None) -> tuple[float, float, float]:
+        eh = 0.5 if eh is None else max(0.0, min(1.0, float(eh)))
+        ea = 1.0 - eh if ea is None else max(0.0, min(1.0, float(ea)))
+        total_e = eh + ea
+        if total_e <= 0:
+            eh, ea = 0.5, 0.5
+        else:
+            eh, ea = eh / total_e, ea / total_e
+        closeness = max(0.0, 1.0 - abs(eh - ea) * 2.0)
+        draw = max(0.10, min(0.35, 0.20 + closeness * 0.15))
+        home = eh * (1.0 - draw)
+        away = ea * (1.0 - draw)
+        return home, draw, away
+
+    elo_h, elo_d, elo_a = _elo_probs(elo_home_score, elo_away_score)
+    calibrated_h = 0.4 * (h / 100.0) + 0.5 * (v7_h / 100.0) + 0.1 * elo_h
+    calibrated_d = 0.4 * (d / 100.0) + 0.5 * (v7_d / 100.0) + 0.1 * elo_d
+    calibrated_a = 0.4 * (a / 100.0) + 0.5 * (v7_a / 100.0) + 0.1 * elo_a
+    total = calibrated_h + calibrated_d + calibrated_a
+    h = round(calibrated_h / total * 100)
+    d = round(calibrated_d / total * 100)
+    a = 100 - h - d
+
     # ─── predicted_score: Skellam モデルの最頻スコア ───
     # Skellam (Poisson×Poisson) は λ_home/λ_away (期待ゴール) から
     # 各試合で P(X=i, Y=j) を計算し、最頻の (i, j) を「予想スコア」として返す。
@@ -1190,6 +1219,7 @@ def compute_hybrid_v9(
         "selection": selection,
         "skellam_raw": {"home": sk_h, "draw": sk_d, "away": sk_a},
         "skellam_boost": sk.get("dynamic_boost", 0.0),
+        "calibration_blend": {"selected": 0.4, "v7": 0.5, "elo": 0.1},
         "model_version": "hybrid_v9.1",
         "lambda_home": sk.get("lambda_home"),
         "lambda_away": sk.get("lambda_away"),

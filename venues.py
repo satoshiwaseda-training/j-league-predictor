@@ -3,6 +3,8 @@ venues.py - Jリーグスタジアム情報データベース
 緯度・経度は Open-Meteo 天気取得に使用
 """
 
+from __future__ import annotations
+
 # スタジアム名 -> 位置・収容人数
 J_LEAGUE_VENUES: dict[str, dict] = {
     # --- J1 主要スタジアム ---
