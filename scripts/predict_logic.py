@@ -1203,6 +1203,20 @@ def compute_hybrid_v9(
     d = round(calibrated_d / total * 100)
     a = 100 - h - d
 
+    # 低確率の away argmax は直近レビューで外れが目立ち、過去検証でも過剰だった。
+    # away が 36% 未満で辛うじて本命になる場合だけ、away を少しホーム/ドローへ戻す。
+    away_dampening_applied = False
+    if a > h and a > d and a < 36:
+        away_dampening_applied = True
+        ph, pd, pa = h / 100.0, d / 100.0, a / 100.0
+        delta = pa * 0.25
+        pa -= delta
+        pd += delta * 0.30
+        ph += delta * 0.70
+        h = round(ph * 100)
+        d = round(pd * 100)
+        a = 100 - h - d
+
     # ─── predicted_score: Skellam モデルの最頻スコア ───
     # Skellam (Poisson×Poisson) は λ_home/λ_away (期待ゴール) から
     # 各試合で P(X=i, Y=j) を計算し、最頻の (i, j) を「予想スコア」として返す。
@@ -1220,6 +1234,7 @@ def compute_hybrid_v9(
         "skellam_raw": {"home": sk_h, "draw": sk_d, "away": sk_a},
         "skellam_boost": sk.get("dynamic_boost", 0.0),
         "calibration_blend": {"selected": 0.4, "v7": 0.5, "elo": 0.1},
+        "away_dampening_applied": away_dampening_applied,
         "model_version": "hybrid_v9.1",
         "lambda_home": sk.get("lambda_home"),
         "lambda_away": sk.get("lambda_away"),
