@@ -1331,6 +1331,7 @@ def _run_onebutton_pipeline(division: str, cache_key: str):
                         v7_prediction=raw_v7_prediction,
                         elo_home_score=elo_h, elo_away_score=elo_a,
                         xg_home=home_xg, xg_away=away_xg,
+                        division=division,
                     )
                     hyb_h = hybrid["home_win_prob"]
                     hyb_d = hybrid["draw_prob"]

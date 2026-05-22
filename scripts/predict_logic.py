@@ -1113,6 +1113,7 @@ def compute_hybrid_v9(
     elo_away_score: float | None = None,
     xg_home: dict | None = None,
     xg_away: dict | None = None,
+    division: str | None = None,
 ) -> dict:
     """
     Hybrid v9.1 (攻撃型): v7 と Skellam dynamic を動的選択し、
@@ -1217,6 +1218,23 @@ def compute_hybrid_v9(
         d = round(pd * 100)
         a = 100 - h - d
 
+    # J2/J3では Skellam の薄い home 本命が過剰。v7本命は壊さず、Skellam採用時だけ補正。
+    lower_division_home_dampening_applied = False
+    if (
+        str(division or "").lower() in {"j2", "j3", "j2j3"}
+        and selection == "skellam"
+        and h >= a and h >= d and h < 42
+    ):
+        lower_division_home_dampening_applied = True
+        ph, pd, pa = h / 100.0, d / 100.0, a / 100.0
+        delta = ph * 0.20
+        ph -= delta
+        pd += delta * 0.40
+        pa += delta * 0.60
+        h = round(ph * 100)
+        d = round(pd * 100)
+        a = 100 - h - d
+
     # ─── predicted_score: Skellam モデルの最頻スコア ───
     # Skellam (Poisson×Poisson) は λ_home/λ_away (期待ゴール) から
     # 各試合で P(X=i, Y=j) を計算し、最頻の (i, j) を「予想スコア」として返す。
@@ -1235,6 +1253,7 @@ def compute_hybrid_v9(
         "skellam_boost": sk.get("dynamic_boost", 0.0),
         "calibration_blend": {"selected": 0.4, "v7": 0.5, "elo": 0.1},
         "away_dampening_applied": away_dampening_applied,
+        "lower_division_home_dampening_applied": lower_division_home_dampening_applied,
         "model_version": "hybrid_v9.1",
         "lambda_home": sk.get("lambda_home"),
         "lambda_away": sk.get("lambda_away"),
